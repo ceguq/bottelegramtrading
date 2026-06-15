@@ -2,7 +2,7 @@ r"""
 MT5 execution module for the XAUUSD Telegram signal bot.
 
 Fill in the MT5 account settings below. This module is called by
-telegram_listener.py to place two pending orders from one parsed signal.
+telegram_listener.py to place three pending orders from one parsed signal.
 
 Valetax terminal path (required):
 If you have both MetaQuotes MT5 and the Valetax MT5 installed, you must
@@ -26,9 +26,12 @@ Actual path depends on where Valetax MT5 was installed.
 
 import logging
 import time
+from functools import wraps
 from pathlib import Path
 
 import MetaTrader5 as mt5
+
+from mt5_lock import mt5_process_lock
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +58,17 @@ SLIPPAGE = 20  # Maximum allowed slippage/deviation in points
 MONITOR_INTERVAL = 5  # Seconds between each breakeven monitor check
 MT5_IPC_RETRIES = 3  # Number of retries when MT5 returns an IPC timeout
 MT5_IPC_RETRY_DELAY = 5  # Seconds to wait between IPC timeout retries
+SL_UPDATE_COMMENT = "TG-SL-UPDATE"
+TP3_COMMENT = "TG-NO-TP"
+
+
+def _with_mt5_lock(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with mt5_process_lock(timeout=30):
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def _is_ipc_timeout(error):
@@ -185,6 +199,7 @@ def connect():
     return True
 
 
+@_with_mt5_lock
 def get_current_reference_price() -> float:
     """Return the latest midpoint price for the configured MT5 symbol."""
 
@@ -218,6 +233,7 @@ def get_current_reference_price() -> float:
         disconnect()
 
 
+@_with_mt5_lock
 def check_orders(
     direction: str,
     entry_first: float,
@@ -232,10 +248,11 @@ def check_orders(
         "sl": None,
         "entry_first": entry_first,
         "entry_second": entry_second,
+        "entry_third": entry_second,
         "current_bid": None,
         "current_ask": None,
         "volume": LOT,
-        "total_volume": LOT * 2,
+        "total_volume": LOT * 3,
         "broker": None,
         "orders": [],
         "error": None,
@@ -304,13 +321,10 @@ def check_orders(
 
         entry_first_norm = _normalize_price(entry_first, digits)
         entry_second_norm = _normalize_price(entry_second, digits)
+        entry_third_norm = entry_second_norm
         sl_raw_norm = _normalize_price(sl_raw, digits)
 
-        sl_actual = (
-            _normalize_price(sl_raw_norm + SL_BUFFER * PIP, digits)
-            if direction_lower == "sell"
-            else _normalize_price(sl_raw_norm - SL_BUFFER * PIP, digits)
-        )
+        sl_actual = sl_raw_norm
 
         tp1 = (
             _normalize_price(entry_first_norm - TP1_PIPS * PIP, digits)
@@ -334,12 +348,13 @@ def check_orders(
 
         order_type_tp1 = _order_type(direction_lower, entry_first_norm, current_price)
         order_type_tp2 = _order_type(direction_lower, entry_second_norm, current_price)
+        order_type_tp3 = _order_type(direction_lower, entry_third_norm, current_price)
 
 
         # Validate SL/TP orientation per-order entry.
         errors = []
         if direction_lower == "buy":
-            # TP BUY: SL < entry_first < TP1 and SL < entry_second < TP2
+            # BUY: SL < entries; TP layers must also have entry < TP.
             if not (sl_actual < entry_first_norm < tp1):
                 errors.append(
                     f"TG-TP1 level invalid: sl_actual={sl_actual}, entry_first={entry_first_norm}, tp1={tp1}"
@@ -348,8 +363,12 @@ def check_orders(
                 errors.append(
                     f"TG-TP2 level invalid: sl_actual={sl_actual}, entry_second={entry_second_norm}, tp2={tp2}"
                 )
+            if not (sl_actual < entry_third_norm):
+                errors.append(
+                    f"{TP3_COMMENT} level invalid: sl_actual={sl_actual}, entry_third={entry_third_norm}"
+                )
         else:
-            # SELL: TP BUY means order direction is sell, so TP1 < entry_first < SL and TP2 < entry_second < SL
+            # SELL: TP layers must have TP < entry; no-TP layer only needs entry < SL.
             if not (tp1 < entry_first_norm < sl_actual):
                 errors.append(
                     f"TG-TP1 level invalid: tp1={tp1}, entry_first={entry_first_norm}, sl_actual={sl_actual}"
@@ -357,6 +376,10 @@ def check_orders(
             if not (tp2 < entry_second_norm < sl_actual):
                 errors.append(
                     f"TG-TP2 level invalid: tp2={tp2}, entry_second={entry_second_norm}, sl_actual={sl_actual}"
+                )
+            if not (entry_third_norm < sl_actual):
+                errors.append(
+                    f"{TP3_COMMENT} level invalid: entry_third={entry_third_norm}, sl_actual={sl_actual}"
                 )
 
 
@@ -371,8 +394,10 @@ def check_orders(
             level_checks = [
                 ("entry1-current_price", _dist(entry_first_norm, current_price), minimum_distance_norm),
                 ("entry2-current_price", _dist(entry_second_norm, current_price), minimum_distance_norm),
+                ("entry3-current_price", _dist(entry_third_norm, current_price), minimum_distance_norm),
                 ("entry1-sl", _dist(entry_first_norm, sl_actual), minimum_distance_norm),
                 ("entry2-sl", _dist(entry_second_norm, sl_actual), minimum_distance_norm),
+                ("entry3-sl", _dist(entry_third_norm, sl_actual), minimum_distance_norm),
                 ("entry1-tp1", _dist(entry_first_norm, tp1), minimum_distance_norm),
                 ("entry2-tp2", _dist(entry_second_norm, tp2), minimum_distance_norm),
             ]
@@ -390,6 +415,7 @@ def check_orders(
         orders = (
             ("TG-TP1", entry_first_norm, tp1, order_type_tp1),
             ("TG-TP2", entry_second_norm, tp2, order_type_tp2),
+            (TP3_COMMENT, entry_third_norm, None, order_type_tp3),
         )
 
         for comment, price_level, tp_level, pending_type in orders:
@@ -400,14 +426,13 @@ def check_orders(
                 "type": pending_type,
                 "price": price_level,
                 "sl": sl_actual,
-                "tp": tp_level,
-
                 "deviation": SLIPPAGE,
                 "magic": MAGIC,
                 "comment": comment,
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_RETURN,
             }
+            request["tp"] = 0.0 if tp_level is None else tp_level
 
             check_result = mt5.order_check(request)
             ok = False
@@ -498,11 +523,11 @@ def _success_retcode(retcode):
 
 def _build_levels(direction, entry_first, entry_second, sl_raw, digits):
     if direction == "sell":
-        sl_actual = sl_raw + SL_BUFFER * PIP
+        sl_actual = sl_raw
         tp1 = entry_first - TP1_PIPS * PIP
         tp2 = entry_second - TP2_PIPS * PIP
     elif direction == "buy":
-        sl_actual = sl_raw - SL_BUFFER * PIP
+        sl_actual = sl_raw
         tp1 = entry_first + TP1_PIPS * PIP
         tp2 = entry_second + TP2_PIPS * PIP
     else:
@@ -515,11 +540,411 @@ def _build_levels(direction, entry_first, entry_second, sl_raw, digits):
     )
 
 
+def _to_int_or_none(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _matches_bot_trade(obj) -> bool:
+    return (
+        getattr(obj, "symbol", None) == SYMBOL
+        and getattr(obj, "magic", None) == MAGIC
+    )
+
+
+def _tp_for_sl_update(label: str, trade_obj) -> float:
+    if label == TP3_COMMENT:
+        return 0.0
+
+    existing_tp = getattr(trade_obj, "tp", 0.0)
+    return 0.0 if existing_tp is None else existing_tp
+
+
+def _get_pending_order_by_ticket(ticket):
+    ticket_int = _to_int_or_none(ticket)
+    if ticket_int is None:
+        return None
+
+    orders = mt5.orders_get(ticket=ticket_int)
+    if not orders:
+        orders = mt5.orders_get(symbol=SYMBOL)
+
+    if not orders:
+        return None
+
+    for order in orders:
+        if getattr(order, "ticket", None) == ticket_int and _matches_bot_trade(order):
+            return order
+
+    return None
+
+
+def _get_history_position_ids_from_order(ticket) -> set[int]:
+    ticket_int = _to_int_or_none(ticket)
+    if ticket_int is None:
+        return set()
+
+    position_ids = set()
+    history_orders = mt5.history_orders_get(ticket=ticket_int)
+    if not history_orders:
+        return position_ids
+
+    for order in history_orders:
+        for field_name in ("position_id", "position"):
+            position_id = _to_int_or_none(getattr(order, field_name, None))
+            if position_id is not None:
+                position_ids.add(position_id)
+
+    return position_ids
+
+
+def _find_position_for_order_ticket(ticket):
+    ticket_int = _to_int_or_none(ticket)
+    if ticket_int is None:
+        return None
+
+    candidate_ids = {ticket_int}
+    candidate_ids.update(_get_history_position_ids_from_order(ticket_int))
+
+    positions = []
+    direct_positions = mt5.positions_get(ticket=ticket_int)
+    if direct_positions:
+        positions.extend(direct_positions)
+
+    symbol_positions = mt5.positions_get(symbol=SYMBOL)
+    if symbol_positions:
+        positions.extend(symbol_positions)
+
+    seen_tickets = set()
+    for position in positions:
+        position_ticket = _to_int_or_none(getattr(position, "ticket", None))
+        if position_ticket in seen_tickets:
+            continue
+        if position_ticket is not None:
+            seen_tickets.add(position_ticket)
+
+        if not _matches_bot_trade(position):
+            continue
+
+        position_ids = {
+            _to_int_or_none(getattr(position, "ticket", None)),
+            _to_int_or_none(getattr(position, "identifier", None)),
+            _to_int_or_none(getattr(position, "position_id", None)),
+            _to_int_or_none(getattr(position, "position", None)),
+        }
+        position_ids.discard(None)
+
+        if candidate_ids.intersection(position_ids):
+            return position
+
+    return None
+
+
+def _send_sl_update_request(request: dict) -> dict:
+    check_result = mt5.order_check(request)
+    if check_result is None:
+        return {
+            "ok": False,
+            "status": "check_failed",
+            "retcode": None,
+            "comment": None,
+            "error": f"order_check returned None: {mt5.last_error()}",
+        }
+
+    check_retcode = getattr(check_result, "retcode", None)
+    check_comment = getattr(check_result, "comment", None)
+    if check_retcode != 0:
+        return {
+            "ok": False,
+            "status": "check_failed",
+            "retcode": check_retcode,
+            "comment": check_comment,
+            "error": f"order_check failed: {mt5.last_error()}",
+        }
+
+    send_result = mt5.order_send(request)
+    if send_result is None:
+        return {
+            "ok": False,
+            "status": "send_failed",
+            "retcode": None,
+            "comment": None,
+            "error": f"order_send returned None: {mt5.last_error()}",
+        }
+
+    send_retcode = getattr(send_result, "retcode", None)
+    send_comment = getattr(send_result, "comment", None)
+    ok = _success_retcode(send_retcode)
+
+    return {
+        "ok": ok,
+        "status": "updated" if ok else "send_failed",
+        "retcode": send_retcode,
+        "comment": send_comment,
+        "error": None if ok else f"order_send failed: {mt5.last_error()}",
+    }
+
+
+def _update_pending_order_sl(label: str, order, new_sl: float) -> dict:
+    mt5_ticket = getattr(order, "ticket", None)
+    existing_tp = _tp_for_sl_update(label, order)
+    existing_price = getattr(order, "price_open", None)
+
+    result = {
+        "label": label,
+        "target": "pending_order",
+        "db_ticket": mt5_ticket,
+        "mt5_ticket": mt5_ticket,
+        "previous_sl": getattr(order, "sl", None),
+        "new_sl": new_sl,
+        "tp": existing_tp,
+        "ok": False,
+        "status": "not_sent",
+        "retcode": None,
+        "comment": None,
+        "error": None,
+    }
+
+    if existing_price is None:
+        result["status"] = "missing_price"
+        result["error"] = "Pending order has no price_open"
+        return result
+
+    request = {
+        "action": mt5.TRADE_ACTION_MODIFY,
+        "order": mt5_ticket,
+        "symbol": SYMBOL,
+        "price": existing_price,
+        "sl": new_sl,
+        "tp": existing_tp,
+        "magic": MAGIC,
+        "comment": SL_UPDATE_COMMENT,
+        "deviation": SLIPPAGE,
+    }
+
+    type_time = getattr(order, "type_time", None)
+    if type_time is not None:
+        request["type_time"] = type_time
+
+    expiration = getattr(order, "time_expiration", None)
+    if expiration not in (None, 0):
+        request["expiration"] = expiration
+
+    result.update(_send_sl_update_request(request))
+
+    if result["ok"]:
+        logger.info(
+            "SL follow-up updated pending order label=%s ticket=%s new_sl=%s preserved_tp=%s",
+            label,
+            mt5_ticket,
+            new_sl,
+            existing_tp,
+        )
+    else:
+        logger.error(
+            "SL follow-up failed for pending order label=%s ticket=%s new_sl=%s status=%s error=%s",
+            label,
+            mt5_ticket,
+            new_sl,
+            result.get("status"),
+            result.get("error"),
+        )
+
+    return result
+
+
+def _update_position_sl(label: str, db_ticket, position, new_sl: float) -> dict:
+    mt5_ticket = getattr(position, "ticket", None)
+    existing_tp = _tp_for_sl_update(label, position)
+
+    result = {
+        "label": label,
+        "target": "position",
+        "db_ticket": db_ticket,
+        "mt5_ticket": mt5_ticket,
+        "previous_sl": getattr(position, "sl", None),
+        "new_sl": new_sl,
+        "tp": existing_tp,
+        "ok": False,
+        "status": "not_sent",
+        "retcode": None,
+        "comment": None,
+        "error": None,
+    }
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": SYMBOL,
+        "position": mt5_ticket,
+        "sl": new_sl,
+        "tp": existing_tp,
+        "magic": MAGIC,
+        "comment": SL_UPDATE_COMMENT,
+        "deviation": SLIPPAGE,
+    }
+
+    result.update(_send_sl_update_request(request))
+
+    if result["ok"]:
+        logger.info(
+            "SL follow-up updated position label=%s db_ticket=%s position_ticket=%s new_sl=%s preserved_tp=%s",
+            label,
+            db_ticket,
+            mt5_ticket,
+            new_sl,
+            existing_tp,
+        )
+    else:
+        logger.error(
+            "SL follow-up failed for position label=%s db_ticket=%s position_ticket=%s new_sl=%s status=%s error=%s",
+            label,
+            db_ticket,
+            mt5_ticket,
+            new_sl,
+            result.get("status"),
+            result.get("error"),
+        )
+
+    return result
+
+
+def _update_sl_for_ticket(label: str, ticket, new_sl: float) -> dict:
+    result = {
+        "label": label,
+        "target": None,
+        "db_ticket": ticket,
+        "mt5_ticket": None,
+        "previous_sl": None,
+        "new_sl": new_sl,
+        "tp": None,
+        "ok": False,
+        "status": "not_found",
+        "retcode": None,
+        "comment": None,
+        "error": None,
+    }
+
+    ticket_int = _to_int_or_none(ticket)
+    if ticket_int is None:
+        result["status"] = "missing_ticket"
+        result["error"] = "DB ticket is empty or invalid"
+        return result
+
+    pending_order = _get_pending_order_by_ticket(ticket_int)
+    if pending_order is not None:
+        return _update_pending_order_sl(label, pending_order, new_sl)
+
+    position = _find_position_for_order_ticket(ticket_int)
+    if position is not None:
+        return _update_position_sl(label, ticket_int, position, new_sl)
+
+    logger.warning(
+        "SL follow-up target not found label=%s db_ticket=%s symbol=%s magic=%s",
+        label,
+        ticket_int,
+        SYMBOL,
+        MAGIC,
+    )
+    return result
+
+
+@_with_mt5_lock
+def update_sl_for_order_group(order_group: dict, new_sl: float) -> dict:
+    """Update SL for existing TP1, TP2, and TP3 tickets from a DB order group."""
+    result = {
+        "ok": False,
+        "order_group_id": order_group.get("id") if isinstance(order_group, dict) else None,
+        "symbol": SYMBOL,
+        "magic": MAGIC,
+        "new_sl": None,
+        "updates": [],
+        "error": None,
+    }
+
+    try:
+        if connect() is not True:
+            result["error"] = "MT5 connection failed"
+            return result
+
+        if not mt5.symbol_select(SYMBOL, True):
+            result["error"] = f"Could not select symbol {SYMBOL}: {mt5.last_error()}"
+            return result
+
+        symbol_info = mt5.symbol_info(SYMBOL)
+        if symbol_info is None:
+            result["error"] = f"Could not read symbol info for {SYMBOL}: {mt5.last_error()}"
+            return result
+
+        new_sl_norm = _normalize_price(new_sl, symbol_info.digits)
+        result["new_sl"] = new_sl_norm
+
+        logger.info(
+            "SL follow-up update start order_group_id=%s ticket_tp1=%s ticket_tp2=%s ticket_tp3=%s new_sl=%s",
+            result["order_group_id"],
+            order_group.get("ticket_tp1") if isinstance(order_group, dict) else None,
+            order_group.get("ticket_tp2") if isinstance(order_group, dict) else None,
+            order_group.get("ticket_tp3") if isinstance(order_group, dict) else None,
+            new_sl_norm,
+        )
+
+        ticket_targets = (
+            ("TG-TP1", "ticket_tp1"),
+            ("TG-TP2", "ticket_tp2"),
+            (TP3_COMMENT, "ticket_tp3"),
+        )
+        for label, ticket_key in ticket_targets:
+            ticket = order_group.get(ticket_key) if isinstance(order_group, dict) else None
+            if ticket is None:
+                result["updates"].append(
+                    {
+                        "label": label,
+                        "target": None,
+                        "db_ticket": None,
+                        "mt5_ticket": None,
+                        "previous_sl": None,
+                        "new_sl": new_sl_norm,
+                        "tp": 0.0 if label == TP3_COMMENT else None,
+                        "ok": True,
+                        "status": "skipped_no_ticket",
+                        "retcode": None,
+                        "comment": None,
+                        "error": None,
+                    }
+                )
+                continue
+
+            update = _update_sl_for_ticket(label, ticket, new_sl_norm)
+            result["updates"].append(update)
+
+        result["ok"] = all(update.get("ok") is True for update in result["updates"])
+
+        logger.info(
+            "SL follow-up update complete order_group_id=%s ok=%s updates=%s",
+            result["order_group_id"],
+            result["ok"],
+            result["updates"],
+        )
+        return result
+
+    except Exception as exc:
+        result["error"] = str(exc)
+        logger.exception("SL follow-up update failed")
+        return result
+
+    finally:
+        disconnect()
+
+
+@_with_mt5_lock
 def place_orders(direction, entry_first, entry_second, sl_raw):
     """
-    Place two pending orders at separate entries with different TP targets.
+    Place three pending orders: two TP layers and one no-TP layer.
 
-    Returns a list of successful ticket numbers: [ticket_tp1, ticket_tp2].
+    Returns successful ticket numbers in order: [ticket_tp1, ticket_tp2, ticket_tp3].
     """
     tickets = []
 
@@ -543,15 +968,18 @@ def place_orders(direction, entry_first, entry_second, sl_raw):
         digits = symbol_info.digits
         entry_first = _normalize_price(entry_first, digits)
         entry_second = _normalize_price(entry_second, digits)
+        entry_third = entry_second
         sl_raw = _normalize_price(sl_raw, digits)
         sl_actual, tp1, tp2 = _build_levels(direction, entry_first, entry_second, sl_raw, digits)
         current_price = tick.bid if direction == "sell" else tick.ask
         order_type_tp1 = _order_type(direction, entry_first, current_price)
         order_type_tp2 = _order_type(direction, entry_second, current_price)
+        order_type_tp3 = _order_type(direction, entry_third, current_price)
 
         orders = (
             ("TG-TP1", entry_first, tp1, order_type_tp1),
             ("TG-TP2", entry_second, tp2, order_type_tp2),
+            (TP3_COMMENT, entry_third, None, order_type_tp3),
         )
 
         for comment, order_entry, tp, order_type in orders:
@@ -562,13 +990,13 @@ def place_orders(direction, entry_first, entry_second, sl_raw):
                 "type": order_type,
                 "price": order_entry,
                 "sl": sl_actual,
-                "tp": tp,
                 "deviation": SLIPPAGE,
                 "magic": MAGIC,
                 "comment": comment,
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_RETURN,
             }
+            request["tp"] = 0.0 if tp is None else tp
 
             check_result = mt5.order_check(request)
             if check_result is None or getattr(check_result, "retcode", None) != 0:

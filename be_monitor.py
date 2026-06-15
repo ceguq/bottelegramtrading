@@ -2,18 +2,19 @@
 Breakeven monitor for the XAUUSD MT5 auto-trading bot.
 
 Implements TP1 -> BE(TP2) safely:
-- Pairing strictly starts from DB-persisted tickets (ticket_tp1, ticket_tp2)
+- Pairing strictly starts from DB-persisted tickets (ticket_tp1, ticket_tp2, ticket_tp3)
 - TP1 proof uses history:
   * history_orders_get(ticket=<pending_tp1_ticket>) to get position_id
   * history_deals_get(position=<tp1_position_id>) to find an exit deal
   * only consider Take Profit closes: reason==DEAL_REASON_TP (defensive via getattr)
   * require profit > 0
 - TP2 BE uses actual open price of TP2 position: tp2_position.price_open
+- TP3 BE uses DB entry_tp3 when available and does not set TP
 - Before modifying SLTP:
   * run mt5.order_check(request)
   * only if check passes, run mt5.order_send(request)
 - Anti-repeat: only process rows from get_pending_orders() (be_moved=0)
-  * after success: mark_be_moved(order_id, tp2_position_ticket=...)
+  * after success: mark_be_moved(order_id, tp2_position_ticket=..., tp3_position_ticket=...)
 
 No automation is executed during editing.
 """
@@ -31,6 +32,7 @@ from db import (
 )
 
 
+from mt5_lock import mt5_process_lock
 from mt5_executor import MAGIC, SLIPPAGE, SYMBOL
 
 logging.basicConfig(
@@ -40,15 +42,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # IMPORTANT: keep connection credentials as they were in the original be_monitor.py
-MT5_LOGIN = 123456  # Your MT5 account login number from your broker
-MT5_PASSWORD = "password"  # Your MT5 account password
-MT5_SERVER = "Valetax-Server"  # Your MT5 broker server name exactly as shown in MT5
+MT5_LOGIN = 371836460  # Your MT5 account login number from your broker
+MT5_PASSWORD = "sw34LOG2311@"  # Your MT5 account password
+MT5_SERVER = "ValetaxIntl-Live2"  # Your MT5 broker server name exactly as shown in MT5
 
 MONITOR_INTERVAL = 5
 
 TP1_COMMENT = "TG-TP1"
 TP2_COMMENT = "TG-TP2"
+TP3_COMMENT = "TG-NO-TP"
 BE_COMMENT = "TG-TP2-BE"
+BE_TP3_COMMENT = "TG-NO-TP-BE"
 
 
 def connect():
@@ -87,13 +91,14 @@ def _normalize_price(price: float, digits: int) -> float:
     return round(float(price), digits)
 
 
-def _get_positions_by_magic_comment() -> Tuple[list, list]:
+def _get_positions_by_magic_comment() -> Tuple[list, list, list]:
     """Active positions for this bot (best-effort)."""
     pos_tp1 = []
     pos_tp2 = []
+    pos_tp3 = []
     positions = mt5.positions_get(symbol=SYMBOL)
     if not positions:
-        return pos_tp1, pos_tp2
+        return pos_tp1, pos_tp2, pos_tp3
 
     for p in positions:
         if getattr(p, "magic", None) != MAGIC:
@@ -103,8 +108,10 @@ def _get_positions_by_magic_comment() -> Tuple[list, list]:
             pos_tp1.append(p)
         elif comment == TP2_COMMENT:
             pos_tp2.append(p)
+        elif comment == TP3_COMMENT:
+            pos_tp3.append(p)
 
-    return pos_tp1, pos_tp2
+    return pos_tp1, pos_tp2, pos_tp3
 
 
 def _find_position_by_comment(position_list: list, expected_comment: str):
@@ -192,17 +199,17 @@ def _get_symbol_trade_stops_level() -> Tuple[Optional[float], Optional[int]]:
 
 
 def _validate_be_sl(be_sl: float, direction: str, bid: float, ask: float, entry: float) -> bool:
-    # BUY: BE SL must be < entry and < current Bid
+    # BUY: BE SL may equal entry, but must stay below current Bid.
     if direction.lower() == "buy":
-        if be_sl >= entry:
+        if be_sl > entry:
             return False
         if be_sl >= bid:
             return False
         return True
 
-    # SELL: BE SL must be > entry and > current Ask
+    # SELL: BE SL may equal entry, but must stay above current Ask.
     if direction.lower() == "sell":
-        if be_sl <= entry:
+        if be_sl < entry:
             return False
         if be_sl <= ask:
             return False
@@ -257,15 +264,78 @@ def _order_check_and_send_sl_tp(request: dict) -> bool:
     return True
 
 
-def _attempt_be_for_row(order_row: dict, tp1_position_list: list, tp2_position_list: list) -> None:
+def _find_position_for_pending_ticket(order_id: int, layer_name: str, pending_ticket, position_list: list):
+    position_id = _get_position_id_from_pending_ticket(pending_ticket)
+    if position_id is None:
+        logger.info("order_id=%s: %s masih pending atau belum menjadi posisi.", order_id, layer_name)
+        return None, None
+
+    for p in position_list:
+        p_pos_id = getattr(p, "position_id", None)
+        if p_pos_id is not None and p_pos_id == position_id:
+            return position_id, p
+
+    for p in position_list:
+        if getattr(p, "ticket", None) == position_id:
+            return position_id, p
+
+    logger.info(
+        "order_id=%s: %s posisi belum ditemukan/terpasang untuk position_id=%s.",
+        order_id,
+        layer_name,
+        position_id,
+    )
+    return position_id, None
+
+
+def _send_be_for_position(
+    order_id: int,
+    layer_name: str,
+    position,
+    be_sl: float,
+    comment: str,
+    include_tp: bool,
+) -> tuple[bool, Optional[int], Optional[float]]:
+    pos_ticket = getattr(position, "ticket", None)
+    if pos_ticket is None:
+        logger.info("order_id=%s: %s position ticket missing.", order_id, layer_name)
+        return False, None, None
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": SYMBOL,
+        "position": pos_ticket,
+        "sl": be_sl,
+        "magic": MAGIC,
+        "comment": comment,
+        "deviation": SLIPPAGE,
+    }
+
+    existing_tp = None
+    if include_tp:
+        existing_tp = getattr(position, "tp", None)
+        if existing_tp is not None:
+            request["tp"] = existing_tp
+
+    ok = _order_check_and_send_sl_tp(request)
+    return ok, pos_ticket, existing_tp
+
+
+def _attempt_be_for_row(
+    order_row: dict,
+    tp1_position_list: list,
+    tp2_position_list: list,
+    tp3_position_list: list,
+) -> None:
     order_id = order_row["id"]
     direction = order_row["direction"].lower()
     legacy_entry = order_row.get("entry")
     entry_tp1 = float(order_row.get("entry_tp1") if order_row.get("entry_tp1") is not None else legacy_entry)
     entry_tp2 = float(order_row.get("entry_tp2") if order_row.get("entry_tp2") is not None else legacy_entry)
-    entry = entry_tp2
+    entry_tp3 = float(order_row.get("entry_tp3") if order_row.get("entry_tp3") is not None else legacy_entry)
     ticket_tp1 = order_row["ticket_tp1"]
     ticket_tp2 = order_row["ticket_tp2"]
+    ticket_tp3 = order_row.get("ticket_tp3")
 
     # 1) TP1 must have already been triggered into a position AND closed by TP.
     tp1_position_id = _get_position_id_from_pending_ticket(ticket_tp1)
@@ -284,34 +354,13 @@ def _attempt_be_for_row(order_row: dict, tp1_position_list: list, tp2_position_l
     # TP1 is proven closed by TP + positive profit.
 
     # 2) Find TP2 position corresponding to ticket_tp2.
-    # We still use active positions list but pairing must be anchored on ticket_tp2.
-    # We attempt to find tp2_position by matching pending ticket position_id.
-    tp2_position_id = _get_position_id_from_pending_ticket(ticket_tp2)
-    if tp2_position_id is None:
-        logger.info("order_id=%s: TP2 masih pending atau belum menjadi posisi.", order_id)
-        return
-
-    tp2_position = None
-    for p in tp2_position_list:
-        # Some APIs store position_id directly; otherwise we compare ticket.
-        p_pos_id = getattr(p, "position_id", None)
-        if p_pos_id is not None and p_pos_id == tp2_position_id:
-            tp2_position = p
-            break
-
+    tp2_position_id, tp2_position = _find_position_for_pending_ticket(
+        order_id,
+        "TP2",
+        ticket_tp2,
+        tp2_position_list,
+    )
     if tp2_position is None:
-        # fallback: compare ticket if available
-        for p in tp2_position_list:
-            if getattr(p, "ticket", None) == tp2_position_id:
-                tp2_position = p
-                break
-
-    if tp2_position is None:
-        logger.info(
-            "order_id=%s: TP2 posisi belum ditemukan/terpasang untuk tp2_position_id=%s.",
-            order_id,
-            tp2_position_id,
-        )
         return
 
     tp2_pos_ticket = getattr(tp2_position, "ticket", None)
@@ -325,7 +374,7 @@ def _attempt_be_for_row(order_row: dict, tp1_position_list: list, tp2_position_l
         logger.error("order_id=%s: cannot read symbol digits.", order_id)
         return
 
-    be_sl = _normalize_price(tp2_open, digits)
+    tp2_be_sl = _normalize_price(tp2_open, digits)
 
     tick = mt5.symbol_info_tick(SYMBOL)
     bid = getattr(tick, "bid", None) if tick else None
@@ -335,110 +384,174 @@ def _attempt_be_for_row(order_row: dict, tp1_position_list: list, tp2_position_l
         logger.info("order_id=%s: market tick unavailable.", order_id)
         return
 
-    if not _validate_be_sl(be_sl=be_sl, direction=direction, bid=bid, ask=ask, entry=entry):
+    if not _validate_be_sl(be_sl=tp2_be_sl, direction=direction, bid=bid, ask=ask, entry=entry_tp2):
         logger.info(
-            "order_id=%s: Skip BE: BE SL invalid vs direction/market (be_sl=%s entry_tp2=%s bid=%s ask=%s)",
+            "order_id=%s: Skip TP2 BE: BE SL invalid vs direction/market (be_sl=%s entry_tp2=%s bid=%s ask=%s)",
             order_id,
-            be_sl,
-            entry,
+            tp2_be_sl,
+            entry_tp2,
             bid,
             ask,
         )
         return
 
     minimum_distance, _ = _get_symbol_trade_stops_level()
-    if minimum_distance is not None:
+    def _too_close_to_market(be_sl: float) -> bool:
+        if minimum_distance is None:
+            return False
         if direction == "buy":
-            if abs(bid - be_sl) < minimum_distance:
-                logger.info("order_id=%s: Skip BE: too close vs trade_stops_level.", order_id)
-                return
+            return abs(bid - be_sl) < minimum_distance
         if direction == "sell":
-            if abs(ask - be_sl) < minimum_distance:
-                logger.info("order_id=%s: Skip BE: too close vs trade_stops_level.", order_id)
-                return
+            return abs(ask - be_sl) < minimum_distance
+        return False
 
-    request = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "symbol": SYMBOL,
-        "position": tp2_pos_ticket,
-        "sl": be_sl,
-        "tp": getattr(tp2_position, "tp", None),
-        "magic": MAGIC,
-        "comment": BE_COMMENT,
-        "deviation": SLIPPAGE,
-    }
+    if _too_close_to_market(tp2_be_sl):
+        logger.info("order_id=%s: Skip TP2 BE: too close vs trade_stops_level.", order_id)
+        return
 
-    # Keep existing TP if available
-    existing_tp = getattr(tp2_position, "tp", None)
-    if existing_tp is not None:
-        request["tp"] = existing_tp
+    tp3_position_id = None
+    tp3_position = None
+    tp3_pos_ticket = None
+    tp3_be_sl = None
+    if ticket_tp3 is not None:
+        tp3_position_id, tp3_position = _find_position_for_pending_ticket(
+            order_id,
+            "TP3",
+            ticket_tp3,
+            tp3_position_list,
+        )
+        if tp3_position is None:
+            return
+
+        tp3_be_sl = _normalize_price(entry_tp3, digits)
+        if not _validate_be_sl(be_sl=tp3_be_sl, direction=direction, bid=bid, ask=ask, entry=entry_tp3):
+            logger.info(
+                "order_id=%s: Skip TP3 BE: BE SL invalid vs direction/market (be_sl=%s entry_tp3=%s bid=%s ask=%s)",
+                order_id,
+                tp3_be_sl,
+                entry_tp3,
+                bid,
+                ask,
+            )
+            return
+
+        if _too_close_to_market(tp3_be_sl):
+            logger.info("order_id=%s: Skip TP3 BE: too close vs trade_stops_level.", order_id)
+            return
 
     logger.info(
         "Attempt BE: order_id=%s\n"
         "  Direction=%s\n"
         "  TP1 ticket(pending)=%s TP1 pos_id=%s (TP closed proof OK)\n"
         "  TP2 ticket(pending)=%s TP2 pos_id=%s\n"
+        "  TP3 ticket(pending)=%s TP3 pos_id=%s\n"
         "  TP2 position ticket=%s\n"
-        "  entry_tp1=%s entry_tp2=%s tp2_open=%s be_sl=%s existing_tp=%s",
+        "  entry_tp1=%s entry_tp2=%s entry_tp3=%s tp2_open=%s tp2_be_sl=%s tp3_be_sl=%s",
         order_id,
         direction,
         ticket_tp1,
         tp1_position_id,
         ticket_tp2,
         tp2_position_id,
+        ticket_tp3,
+        tp3_position_id,
         tp2_pos_ticket,
         entry_tp1,
         entry_tp2,
+        entry_tp3,
         tp2_open,
-        be_sl,
-        existing_tp,
+        tp2_be_sl,
+        tp3_be_sl,
     )
 
-    ok = _order_check_and_send_sl_tp(request)
+    ok, tp2_pos_ticket, existing_tp = _send_be_for_position(
+        order_id,
+        "TP2",
+        tp2_position,
+        tp2_be_sl,
+        BE_COMMENT,
+        include_tp=True,
+    )
     if not ok:
-        logger.info("BE SLTP failed: order_id=%s", order_id)
+        logger.info("TP2 BE SLTP failed: order_id=%s", order_id)
         return
 
-    mark_be_moved(order_id, tp2_position_ticket=tp2_pos_ticket)
+    if ticket_tp3 is not None:
+        ok, tp3_pos_ticket, _ = _send_be_for_position(
+            order_id,
+            "TP3",
+            tp3_position,
+            tp3_be_sl,
+            BE_TP3_COMMENT,
+            include_tp=False,
+        )
+        if not ok:
+            logger.info("TP3 BE SLTP failed: order_id=%s", order_id)
+            return
+
+    mark_be_moved(
+        order_id,
+        tp2_position_ticket=tp2_pos_ticket,
+        tp3_position_ticket=tp3_pos_ticket,
+    )
 
     logger.info(
-        "Break Even applied to TG-TP2: order_id=%s tp1_ticket=%s tp2_position_ticket=%s entry_tp1=%s entry_tp2=%s tp2_open=%s new_sl=%s",
+        "Break Even applied: order_id=%s tp1_ticket=%s tp2_position_ticket=%s tp3_position_ticket=%s entry_tp1=%s entry_tp2=%s entry_tp3=%s tp2_open=%s tp2_new_sl=%s tp3_new_sl=%s tp2_existing_tp=%s",
         order_id,
         ticket_tp1,
         tp2_pos_ticket,
+        tp3_pos_ticket,
         entry_tp1,
         entry_tp2,
+        entry_tp3,
         tp2_open,
-        be_sl,
+        tp2_be_sl,
+        tp3_be_sl,
+        existing_tp,
     )
 
 
 def monitor_loop():
+    init_db()
+    logger.info("BE monitor berjalan. Interval=%s detik", MONITOR_INTERVAL)
+
     try:
-        init_db()
-        connect()
-        logger.info("BE monitor berjalan. Interval=%s detik", MONITOR_INTERVAL)
-
         while True:
-            orders = get_pending_orders()
+            try:
+                with mt5_process_lock(timeout=30):
+                    connect()
+                    try:
+                        orders = get_pending_orders()
 
-            tp1_positions, tp2_positions = _get_positions_by_magic_comment()
+                        tp1_positions, tp2_positions, tp3_positions = _get_positions_by_magic_comment()
 
-            # Only consider TP2 positions tagged by comment; pairing is still anchored by tickets.
-            for order_row in orders:
-                try:
-                    if not tp1_positions:
-                        logger.info("order_id=%s: TP1 masih pending (no active TP1 positions).", order_row["id"])
-                    _attempt_be_for_row(order_row, tp1_positions, tp2_positions)
-                except Exception:
-                    logger.exception("BE monitor exception for order_id=%s", order_row.get("id"))
+                        # Only consider bot-tagged positions; pairing is still anchored by DB tickets.
+                        for order_row in orders:
+                            try:
+                                if not tp1_positions:
+                                    logger.info(
+                                        "order_id=%s: TP1 masih pending (no active TP1 positions).",
+                                        order_row["id"],
+                                    )
+                                _attempt_be_for_row(
+                                    order_row,
+                                    tp1_positions,
+                                    tp2_positions,
+                                    tp3_positions,
+                                )
+                            except Exception:
+                                logger.exception("BE monitor exception for order_id=%s", order_row.get("id"))
+                    finally:
+                        disconnect()
+            except TimeoutError:
+                logger.warning("BE monitor skipped cycle: MT5 lock timeout.")
+            except Exception:
+                logger.exception("BE monitor cycle failed.")
 
             time.sleep(MONITOR_INTERVAL)
 
     except KeyboardInterrupt:
         logger.info("BE monitor dihentikan oleh user.")
-    finally:
-        disconnect()
 
 
 if __name__ == "__main__":

@@ -16,12 +16,13 @@ import re
 
 from telethon import TelegramClient, events
 
-from db import init_db, insert_order
+from db import get_latest_active_order, init_db, insert_order
 from mt5_executor import (
     SYMBOL as MT5_SYMBOL,
     check_orders,
     place_orders,
     get_current_reference_price,
+    update_sl_for_order_group,
 )
 
 logging.basicConfig(
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 API_ID = 37673990  # API ID from https://my.telegram.org
 API_HASH = "a9a7c7a933318f577f7d16aeb05a63db"  # API hash from https://my.telegram.org
 PHONE = "+6281229995423"  # Telegram phone number with country code
-SOURCE_CHAT_ID = -1003511779760  # Signal channel/group/chat ID from cari_chat_id.py
+SOURCE_CHAT_ID = 7955628010  # Signal channel/group/chat ID from cari_chat_id.py
 
 # False = aktifkan pengiriman pending order nyata ke MT5 (real execution)
 TELEGRAM_TEST_MODE = False
@@ -57,7 +58,7 @@ PRICE_RANGE_PATTERN = re.compile(
     r"(?P<price_a>\d+(?:\.\d+)?)\s*(?:-|\u2013)\s*(?P<price_b>\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
-DIRECTION_PATTERN = re.compile(r"\b(?P<direction>buy|sell)\b", re.IGNORECASE)
+DIRECTION_PATTERN = re.compile(r"\b(?P<direction>buy|sell|sel)\b", re.IGNORECASE)
 SL_PATTERN = re.compile(r"\bsl\b\s*[:=]?\s*(?P<sl>\d+(?:\.\d+)?)", re.IGNORECASE)
 
 # In-memory dedup store for Telegram messages: chat_id + message_id
@@ -94,6 +95,33 @@ def _expand_short_price(token: str, reference_price: float) -> float:
     return expanded_price
 
 
+def _normalize_direction(direction: str) -> str:
+    direction = str(direction).strip().lower()
+    if direction == "sel":
+        return "sell"
+    return direction
+
+
+def _is_short_integer(token: str | None) -> bool:
+    if token is None:
+        return False
+
+    token = str(token).strip()
+    if not token:
+        return False
+
+    token_int = token.split(".", 1)[0].lstrip("+-")
+    return len(token_int.lstrip("0")) <= 2
+
+
+def _expand_if_needed(raw_token: str, reference_price: float | None) -> float:
+    if raw_token is None:
+        raise ValueError("raw_token is None")
+    if _is_short_integer(raw_token) and reference_price is not None:
+        return _expand_short_price(raw_token, reference_price)
+    return float(raw_token)
+
+
 def parse_signal(text: str) -> dict | None:
     """Parse a signal into direction and raw (possibly short) entry range + SL.
 
@@ -119,26 +147,86 @@ def parse_signal(text: str) -> dict | None:
     token_b = range_match.group("price_b")
 
     return {
-        "direction": direction_match.group("direction").lower(),
+        "direction": _normalize_direction(direction_match.group("direction")),
         "raw_entry_first": token_a,
         "raw_entry_second": token_b,
+        "raw_range": f"{token_a}-{token_b}",
         "raw_sl": sl_match.group("sl") if sl_match is not None else None,
     }
 
 
+def parse_sl_update(text: str) -> dict | None:
+    """Parse an SL-only follow-up message without creating a new signal."""
+    if not text:
+        return None
+
+    if DIRECTION_PATTERN.search(text) is not None:
+        return None
+
+    if PRICE_RANGE_PATTERN.search(text) is not None:
+        return None
+
+    sl_match = SL_PATTERN.search(text)
+    if sl_match is None:
+        return None
+
+    return {"raw_sl": sl_match.group("sl")}
 
 
-@client.on(events.NewMessage(chats=SOURCE_CHAT_ID))
-async def handle_signal(event):
-    """Handle a new Telegram message from the configured signal chat."""
-    logger.info("Telegram message received")
+def _build_order_plan(signal: dict, reference_price: float | None) -> dict:
+    raw_first = signal.get("raw_entry_first")
+    raw_second = signal.get("raw_entry_second")
+    raw_sl = signal.get("raw_sl")
+    direction = signal["direction"]
 
-    signal = parse_signal(event.raw_text or "")
-    if signal is None:
-        logger.info("Bukan format sinyal, dilewati.")
-        return
+    expanded_first = _expand_if_needed(raw_first, reference_price)
+    expanded_second = _expand_if_needed(raw_second, reference_price)
+    expanded_low = min(expanded_first, expanded_second)
+    expanded_high = max(expanded_first, expanded_second)
 
-    # Dedupe: chat_id + event.id
+    if direction == "sell":
+        selected_entry = expanded_low
+        selected_entry_mode = "SELL/SEL uses lower range"
+    else:
+        selected_entry = expanded_high
+        selected_entry_mode = "BUY uses higher range"
+
+    sl_source = "telegram" if raw_sl is not None else "emergency_50_pips"
+    if raw_sl is not None:
+        final_sl = _expand_if_needed(raw_sl, reference_price)
+    elif direction == "buy":
+        final_sl = selected_entry - 50 * PIP
+    else:
+        final_sl = selected_entry + 50 * PIP
+
+    tp1_target = (
+        selected_entry + TP1_PIPS * PIP
+        if direction == "buy"
+        else selected_entry - TP1_PIPS * PIP
+    )
+    tp2_target = (
+        selected_entry + TP2_PIPS * PIP
+        if direction == "buy"
+        else selected_entry - TP2_PIPS * PIP
+    )
+
+    return {
+        "expanded_entry_first": expanded_first,
+        "expanded_entry_second": expanded_second,
+        "expanded_range": f"{expanded_first}-{expanded_second}",
+        "selected_entry_mode": selected_entry_mode,
+        "entry_first": selected_entry,
+        "entry_second": selected_entry,
+        "entry_third": selected_entry,
+        "sl": final_sl,
+        "sl_source": sl_source,
+        "tp1_target": tp1_target,
+        "tp2_target": tp2_target,
+        "tp3_target": None,
+    }
+
+
+def _is_duplicate_event(event) -> bool:
     chat_id = getattr(event, "chat_id", None)
     message_id = getattr(event, "id", None)
     if message_id is None:
@@ -149,7 +237,7 @@ async def handle_signal(event):
     if chat_id is not None and message_id is not None:
         if message_key in _dedup_store:
             print("Duplicate Telegram message ignored")
-            return
+            return True
 
         _dedup_store[message_key] = True
         if len(_dedup_store) > _MAX_DEDUP_KEYS:
@@ -157,18 +245,125 @@ async def handle_signal(event):
             for k in list(_dedup_store.keys())[:200]:
                 _dedup_store.pop(k, None)
 
+    return False
+
+
+async def _handle_sl_update(sl_update: dict):
+    loop = asyncio.get_running_loop()
+    raw_sl = sl_update["raw_sl"]
+    reference_price = None
+
+    if _is_short_integer(raw_sl):
+        reference_price = await loop.run_in_executor(None, get_current_reference_price)
+
+    final_sl = _expand_if_needed(raw_sl, reference_price)
+    order_group = get_latest_active_order()
+
+    logger.info(
+        "SL follow-up parsed raw_sl=%s reference_price=%s final_sl=%s",
+        raw_sl,
+        reference_price,
+        final_sl,
+    )
+
+    print("[SL FOLLOW-UP UPDATE]")
+    print("SL source: followup_update")
+    print("Reference price:", reference_price)
+    print("Raw SL:", raw_sl)
+    print("Final SL sent to MT5:", final_sl)
+
+    if order_group is None:
+        logger.warning("No active order group found for SL follow-up update.")
+        print("No active order group found; no MT5 update sent.")
+        return
+
+    print("Latest active order group id:", order_group.get("id"))
+    print("TP1 ticket:", order_group.get("ticket_tp1"))
+    print("TP2 ticket:", order_group.get("ticket_tp2"))
+    print("TP3 ticket:", order_group.get("ticket_tp3"))
+
+    if TELEGRAM_TEST_MODE is True:
+        print("[TELEGRAM TEST MODE]")
+        print("No MT5 SL will be modified")
+        print(
+            "Would update SL for latest active order group:",
+            {
+                "id": order_group.get("id"),
+                "ticket_tp1": order_group.get("ticket_tp1"),
+                "ticket_tp2": order_group.get("ticket_tp2"),
+                "ticket_tp3": order_group.get("ticket_tp3"),
+                "new_sl": final_sl,
+            },
+        )
+        return
+
+    try:
+        update_result = await loop.run_in_executor(
+            None,
+            update_sl_for_order_group,
+            order_group,
+            final_sl,
+        )
+    except Exception:
+        logger.exception("Failed to update SL follow-up in MT5.")
+        return
+
+    print("SL follow-up update result:", update_result)
+    for update in update_result.get("updates", []):
+        logger.info(
+            "SL follow-up update target=%s db_ticket=%s status=%s mt5_ticket=%s new_sl=%s",
+            update.get("label"),
+            update.get("db_ticket"),
+            update.get("status"),
+            update.get("mt5_ticket"),
+            update.get("new_sl"),
+        )
+
+
+# Manual parser checks for this no-framework repo. These document the expected
+# pure-function behavior without starting Telegram or MT5 loops.
+PARSER_MANUAL_CHECKS = (
+    "SELL 4566-4569 SL 4574 -> sell, entries 4566/4566, SL 4574",
+    "SEL 4566-4569 SL 4574 -> sell, entries 4566/4566, SL 4574",
+    "BUY 4566-4569 SL 4563 -> buy, entries 4569/4569, SL 4563",
+    "recov sel 56-58 sl 60 with reference 4655 -> sell, entries 4656/4656, SL 4660",
+    "BUY 4566-4569 -> buy, entries 4569/4569, emergency SL 4564",
+    "SELL 4566-4569 -> sell, entries 4566/4566, emergency SL 4571",
+    "SL 4574 -> follow-up update only",
+    "SL 60 with reference 4655 -> follow-up update only, SL 4660",
+)
+
+
+
+
+@client.on(events.NewMessage(chats=SOURCE_CHAT_ID))
+async def handle_signal(event):
+    """Handle a new Telegram message from the configured signal chat."""
+    logger.info("Telegram message received")
+    raw_text = event.raw_text or ""
+    logger.info("Raw Telegram text: %s", raw_text)
+    print("Raw Telegram text:", raw_text)
+
+    signal = parse_signal(raw_text)
+    if signal is None:
+        sl_update = parse_sl_update(raw_text)
+        if sl_update is None:
+            logger.info("Bukan format sinyal, dilewati.")
+            return
+        if _is_duplicate_event(event):
+            return
+        await _handle_sl_update(sl_update)
+        return
+
+    if _is_duplicate_event(event):
+        return
+
 
     loop = asyncio.get_running_loop()
     reference_price = None
     raw_first = signal.get("raw_entry_first")
     raw_second = signal.get("raw_entry_second")
     raw_sl = signal.get("raw_sl")
-
-    def _is_short_integer(token: str) -> bool:
-        token = str(token).strip()
-        token_int = token.split(".")[0]
-        # Max 2 digits (ignoring leading zeros) => short token
-        return len(token_int.lstrip("0")) <= 2
 
     # Decide whether expansion is needed
     need_reference = (
@@ -180,66 +375,39 @@ async def handle_signal(event):
     if need_reference:
         reference_price = await loop.run_in_executor(None, get_current_reference_price)
 
-    def _expand_if_needed(raw_token: str) -> float:
-        if raw_token is None:
-            raise ValueError("raw_token is None")
-        if _is_short_integer(raw_token) and reference_price is not None:
-            return _expand_short_price(raw_token, reference_price)
-        return float(raw_token)
-
-    entry_first = _expand_if_needed(raw_first)
-    entry_second = _expand_if_needed(raw_second)
-
-    sl_source = "telegram" if raw_sl is not None else "auto_50_pips"
-
-    DEFAULT_SL_PIPS = 50
-    if raw_sl is not None:
-        sl_raw = (
-            _expand_short_price(raw_sl, reference_price)
-            if _is_short_integer(raw_sl) and reference_price is not None
-            else float(raw_sl)
-        )
-        sl_final_expected = (
-            sl_raw - SL_BUFFER * PIP if signal["direction"] == "buy" else sl_raw + SL_BUFFER * PIP
-        )
-        # sl_final_expected above is just for logging; final SL is what executor computes
-    else:
-        if signal["direction"] == "buy":
-            sl_raw = entry_second - (DEFAULT_SL_PIPS - SL_BUFFER) * PIP
-            sl_final_expected = entry_second - DEFAULT_SL_PIPS * PIP
-        else:
-            sl_raw = entry_second + (DEFAULT_SL_PIPS - SL_BUFFER) * PIP
-            sl_final_expected = entry_second + DEFAULT_SL_PIPS * PIP
-
-    signal["entry_first"] = entry_first
-    signal["entry_second"] = entry_second
-    signal["sl"] = sl_raw
+    order_plan = _build_order_plan(signal, reference_price)
+    signal.update(order_plan)
 
     logger.info(
-        "Signal valid direction=%s entry_tp1=%s entry_tp2=%s sl=%s",
+        "Signal valid direction=%s raw_range=%s expanded_range=%s mode=%s entry_first=%s entry_second=%s entry_third=%s sl_source=%s final_sl=%s tp1=%s tp2=%s tp3=%s",
         signal["direction"],
+        signal.get("raw_range"),
+        signal["expanded_range"],
+        signal["selected_entry_mode"],
         signal["entry_first"],
         signal["entry_second"],
+        signal["entry_third"],
+        signal["sl_source"],
         signal["sl"],
+        signal["tp1_target"],
+        signal["tp2_target"],
+        "NO TP",
     )
 
     print("Direction:", signal["direction"].upper())
     print("Reference price:", reference_price)
     print("Raw entry range:", f"{raw_first}-{raw_second}")
-    print("Entry TP1:", entry_first)
-    print("Entry TP2:", entry_second)
-    print("SL source:", sl_source)
+    print("Expanded range:", signal["expanded_range"])
+    print("Selected entry mode:", signal["selected_entry_mode"])
+    print("Final entry_first:", signal["entry_first"])
+    print("Final entry_second:", signal["entry_second"])
+    print("Final entry_third:", signal["entry_third"])
+    print("SL source:", signal["sl_source"])
     print("Raw SL:", raw_sl)
-    print("SL input:", sl_raw)
-    print("Expected final SL:", sl_final_expected)
-    tp1_target = (
-        entry_first + TP1_PIPS * PIP if signal["direction"] == "buy" else entry_first - TP1_PIPS * PIP
-    )
-    tp2_target = (
-        entry_second + TP2_PIPS * PIP if signal["direction"] == "buy" else entry_second - TP2_PIPS * PIP
-    )
-    print("TP1 target:", tp1_target)
-    print("TP2 target:", tp2_target)
+    print("Final SL sent to MT5:", signal["sl"])
+    print("Layer 1 / TG-TP1: TP 50 pips target:", signal["tp1_target"])
+    print("Layer 2 / TG-TP2: TP 100 pips target:", signal["tp2_target"])
+    print("Layer 3 / TG-NO-TP: NO TP")
 
     # TEST MODE path
     if TELEGRAM_TEST_MODE is True:
@@ -250,7 +418,7 @@ async def handle_signal(event):
         print("Signal received and parsed successfully")
         print(f"Direction: {signal.get('direction', 'Unavailable').upper()}")
         print(f"Symbol: {MT5_SYMBOL}")
-        print(f"Stop Loss input: {sl_raw}")
+        print(f"Stop Loss input: {signal['sl']}")
 
         try:
             loop = asyncio.get_running_loop()
@@ -320,6 +488,7 @@ async def handle_signal(event):
     print(f"Symbol: {MT5_SYMBOL}")
     print(f"Entry first: {signal['entry_first']}")
     print(f"Entry second: {signal['entry_second']}")
+    print(f"Entry third: {signal['entry_third']}")
 
     print(f"Stop Loss: {sl}")
 
@@ -339,10 +508,21 @@ async def handle_signal(event):
 
     print(f"MT5 returned tickets: {tickets}")
 
-    if len(tickets) >= 2:
-        insert_order(tickets[0], tickets[1], direction, signal["entry_first"], signal["entry_second"])
+    if len(tickets) >= 3:
+        insert_order(
+            tickets[0],
+            tickets[1],
+            direction,
+            signal["entry_first"],
+            signal["entry_second"],
+            ticket_tp3=tickets[2],
+            entry_tp3=signal["entry_third"],
+        )
 
-        logger.info("Two pending orders placed successfully")
+        logger.info("Three pending orders placed successfully")
+    elif len(tickets) >= 2:
+        insert_order(tickets[0], tickets[1], direction, signal["entry_first"], signal["entry_second"])
+        logger.warning("Partial failure: only 2 pending orders placed tickets=%s", tickets)
     elif len(tickets) == 1:
         logger.warning("Partial failure: only 1 pending order placed tickets=%s", tickets)
     else:

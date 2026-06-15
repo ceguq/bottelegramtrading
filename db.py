@@ -27,6 +27,33 @@ def _ensure_entry_columns(conn):
     if "entry_tp2" not in columns:
         conn.execute("ALTER TABLE active_orders ADD COLUMN entry_tp2 REAL")
 
+    if "tp1_closed" not in columns:
+        conn.execute(
+            "ALTER TABLE active_orders ADD COLUMN tp1_closed INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "tp1_closed_by_tp" not in columns:
+        conn.execute(
+            "ALTER TABLE active_orders ADD COLUMN tp1_closed_by_tp INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "tp1_profit_positive" not in columns:
+        conn.execute(
+            "ALTER TABLE active_orders ADD COLUMN tp1_profit_positive INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "tp2_position_ticket" not in columns:
+        conn.execute("ALTER TABLE active_orders ADD COLUMN tp2_position_ticket INTEGER")
+
+    if "ticket_tp3" not in columns:
+        conn.execute("ALTER TABLE active_orders ADD COLUMN ticket_tp3 INTEGER")
+
+    if "entry_tp3" not in columns:
+        conn.execute("ALTER TABLE active_orders ADD COLUMN entry_tp3 REAL")
+
+    if "tp3_position_ticket" not in columns:
+        conn.execute("ALTER TABLE active_orders ADD COLUMN tp3_position_ticket INTEGER")
+
 
 def init_db():
     """Create the active_orders table if it does not already exist."""
@@ -44,7 +71,10 @@ def init_db():
                   tp1_closed INTEGER NOT NULL DEFAULT 0,
                   tp1_closed_by_tp INTEGER NOT NULL DEFAULT 0,
                   tp1_profit_positive INTEGER NOT NULL DEFAULT 0,
-                  tp2_position_ticket INTEGER
+                  tp2_position_ticket INTEGER,
+                  ticket_tp3 INTEGER,
+                  entry_tp3 REAL,
+                  tp3_position_ticket INTEGER
                 )
 
                 """
@@ -54,8 +84,17 @@ def init_db():
     logger.info("Database initialized: %s", DB_PATH)
 
 
-def insert_order(ticket_tp1, ticket_tp2, direction, entry_first, entry_second):
-    """Save a new active order pair to SQLite."""
+def insert_order(
+    ticket_tp1,
+    ticket_tp2,
+    direction,
+    entry_first,
+    entry_second,
+    ticket_tp3=None,
+    entry_tp3=None,
+):
+    """Save a new active order group to SQLite."""
+    entry_third = entry_tp3 if entry_tp3 is not None else entry_second
     with closing(sqlite3.connect(DB_PATH)) as conn:
         with conn:
             _ensure_entry_columns(conn)
@@ -67,9 +106,11 @@ def insert_order(ticket_tp1, ticket_tp2, direction, entry_first, entry_second):
                     direction,
                     entry,
                     entry_tp1,
-                    entry_tp2
+                    entry_tp2,
+                    ticket_tp3,
+                    entry_tp3
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ticket_tp1,
@@ -78,10 +119,12 @@ def insert_order(ticket_tp1, ticket_tp2, direction, entry_first, entry_second):
                     entry_first,
                     entry_first,
                     entry_second,
+                    ticket_tp3,
+                    entry_third,
                 ),
             )
 
-    logger.info("Order saved to DB: tp1=%s tp2=%s", ticket_tp1, ticket_tp2)
+    logger.info("Order saved to DB: tp1=%s tp2=%s tp3=%s", ticket_tp1, ticket_tp2, ticket_tp3)
 
 
 def get_pending_orders() -> list[dict]:
@@ -99,10 +142,13 @@ def get_pending_orders() -> list[dict]:
                        entry,
                        COALESCE(entry_tp1, entry) AS entry_tp1,
                        COALESCE(entry_tp2, entry) AS entry_tp2,
+                       ticket_tp3,
+                       COALESCE(entry_tp3, entry) AS entry_tp3,
                        tp1_closed,
                        tp1_closed_by_tp,
                        tp1_profit_positive,
-                       tp2_position_ticket
+                       tp2_position_ticket,
+                       tp3_position_ticket
                 FROM active_orders
 
                 WHERE be_moved = 0
@@ -114,11 +160,48 @@ def get_pending_orders() -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def mark_be_moved(order_id, tp2_position_ticket=None):
+def get_latest_active_order() -> dict | None:
+    """Return the newest active order group that has not moved to BE yet."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        with conn:
+            _ensure_entry_columns(conn)
+            row = conn.execute(
+                """
+                SELECT id,
+                       ticket_tp1,
+                       ticket_tp2,
+                       direction,
+                       entry,
+                       COALESCE(entry_tp1, entry) AS entry_tp1,
+                       COALESCE(entry_tp2, entry) AS entry_tp2,
+                       ticket_tp3,
+                       COALESCE(entry_tp3, entry) AS entry_tp3,
+                       tp1_closed,
+                       tp1_closed_by_tp,
+                       tp1_profit_positive,
+                       tp2_position_ticket,
+                       tp3_position_ticket
+                FROM active_orders
+                WHERE be_moved = 0
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+    if row is None:
+        logger.info("No latest active order found for SL update.")
+        return None
+
+    return dict(row)
+
+
+def mark_be_moved(order_id, tp2_position_ticket=None, tp3_position_ticket=None):
     """Mark an order row as already moved to breakeven."""
     with closing(sqlite3.connect(DB_PATH)) as conn:
         with conn:
-            if tp2_position_ticket is None:
+            _ensure_entry_columns(conn)
+            if tp2_position_ticket is None and tp3_position_ticket is None:
                 conn.execute(
                     "UPDATE active_orders SET be_moved = 1 WHERE id = ?",
                     (order_id,),
@@ -128,10 +211,11 @@ def mark_be_moved(order_id, tp2_position_ticket=None):
                     """
                     UPDATE active_orders
                     SET be_moved = 1,
-                        tp2_position_ticket = COALESCE(tp2_position_ticket, ?)
+                        tp2_position_ticket = COALESCE(tp2_position_ticket, ?),
+                        tp3_position_ticket = COALESCE(tp3_position_ticket, ?)
                     WHERE id = ?
                     """,
-                    (tp2_position_ticket, order_id),
+                    (tp2_position_ticket, tp3_position_ticket, order_id),
                 )
 
     logger.info("Order id=%s marked as BE moved.", order_id)
@@ -140,6 +224,7 @@ def mark_be_moved(order_id, tp2_position_ticket=None):
 def mark_tp1_status(order_id, closed: bool, closed_by_tp: bool, profit_positive: bool):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         with conn:
+            _ensure_entry_columns(conn)
             conn.execute(
                 """
                 UPDATE active_orders

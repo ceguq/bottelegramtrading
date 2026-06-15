@@ -7,3 +7,4 @@ __pycache__/
 active_orders.db
 logs/
 *.log
+active_orders.mt5.lock
