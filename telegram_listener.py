@@ -1,0 +1,369 @@
+"""
+Telegram listener for the XAUUSD MT5 auto-trading bot.
+
+Fill in the Telegram settings below, set SOURCE_CHAT_ID using cari_chat_id.py,
+then run this file to listen for valid signals and submit MT5 pending orders.
+New order state is saved to SQLite so be_monitor.py can read it from a
+separate process.
+"""
+
+# Install dependencies:
+# pip install telethon MetaTrader5
+
+import asyncio
+import logging
+import re
+
+from telethon import TelegramClient, events
+
+from db import init_db, insert_order
+from mt5_executor import (
+    SYMBOL as MT5_SYMBOL,
+    check_orders,
+    place_orders,
+    get_current_reference_price,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+API_ID = 37673990  # API ID from https://my.telegram.org
+API_HASH = "a9a7c7a933318f577f7d16aeb05a63db"  # API hash from https://my.telegram.org
+PHONE = "+6281229995423"  # Telegram phone number with country code
+SOURCE_CHAT_ID = -1003511779760  # Signal channel/group/chat ID from cari_chat_id.py
+
+# False = aktifkan pengiriman pending order nyata ke MT5 (real execution)
+TELEGRAM_TEST_MODE = False
+
+
+
+LOT = 0.01  # Lot size for each pending order
+PIP = 0.1  # 1 pip = 0.1 for XAUUSD
+TP1_PIPS = 50  # Pips for Order 1 take profit
+TP2_PIPS = 100  # Pips for Order 2 take profit
+SL_BUFFER = 10  # Extra pips added to the raw signal SL
+MAGIC = 20250611  # Magic number to identify orders from this bot
+SLIPPAGE = 20  # Maximum allowed slippage/deviation in points
+MONITOR_INTERVAL = 5  # Seconds between each breakeven monitor check
+
+SESSION_NAME = "xauusd_signal_session"  # Local Telethon session file name
+
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+PRICE_RANGE_PATTERN = re.compile(
+    r"(?P<price_a>\d+(?:\.\d+)?)\s*(?:-|\u2013)\s*(?P<price_b>\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+DIRECTION_PATTERN = re.compile(r"\b(?P<direction>buy|sell)\b", re.IGNORECASE)
+SL_PATTERN = re.compile(r"\bsl\b\s*[:=]?\s*(?P<sl>\d+(?:\.\d+)?)", re.IGNORECASE)
+
+# In-memory dedup store for Telegram messages: chat_id + message_id
+_dedup_store: dict[str, bool] = {}
+_MAX_DEDUP_KEYS = 1000
+
+
+def _expand_short_price(token: str, reference_price: float) -> float:
+    import math
+
+    token_text = str(token).strip()
+    if not token_text:
+        raise ValueError("empty token")
+
+    integer_part = token_text.split(".", 1)[0].lstrip("+-")
+    try:
+        short_value = float(token_text)
+    except ValueError as e:
+        raise ValueError(f"invalid price token: {token_text}") from e
+
+    if len(integer_part) > 2:
+        return short_value
+
+    current_block = math.floor(reference_price / 100.0) * 100.0
+    current_suffix = reference_price - current_block
+
+    expanded_price = current_block + short_value
+
+    if current_suffix >= 75.0 and short_value <= 25.0:
+        expanded_price += 100.0
+    elif current_suffix <= 25.0 and short_value >= 75.0:
+        expanded_price -= 100.0
+
+    return expanded_price
+
+
+def parse_signal(text: str) -> dict | None:
+    """Parse a signal into direction and raw (possibly short) entry range + SL.
+
+    Output keys intentionally do NOT include expanded prices; expansion happens
+    in handle_signal() once reference_price is fetched.
+    """
+
+    if not text:
+
+        return None
+
+    direction_match = DIRECTION_PATTERN.search(text)
+    if direction_match is None:
+        return None
+
+    range_match = PRICE_RANGE_PATTERN.search(text)
+    sl_match = SL_PATTERN.search(text)
+    if range_match is None:
+        return None
+
+    # Token strings; final per-order entries are resolved later.
+    token_a = range_match.group("price_a")
+    token_b = range_match.group("price_b")
+
+    return {
+        "direction": direction_match.group("direction").lower(),
+        "raw_entry_first": token_a,
+        "raw_entry_second": token_b,
+        "raw_sl": sl_match.group("sl") if sl_match is not None else None,
+    }
+
+
+
+
+@client.on(events.NewMessage(chats=SOURCE_CHAT_ID))
+async def handle_signal(event):
+    """Handle a new Telegram message from the configured signal chat."""
+    logger.info("Telegram message received")
+
+    signal = parse_signal(event.raw_text or "")
+    if signal is None:
+        logger.info("Bukan format sinyal, dilewati.")
+        return
+
+    # Dedupe: chat_id + event.id
+    chat_id = getattr(event, "chat_id", None)
+    message_id = getattr(event, "id", None)
+    if message_id is None:
+        message_obj = getattr(event, "message", None)
+        message_id = getattr(message_obj, "id", None)
+
+    message_key = (chat_id, message_id)
+    if chat_id is not None and message_id is not None:
+        if message_key in _dedup_store:
+            print("Duplicate Telegram message ignored")
+            return
+
+        _dedup_store[message_key] = True
+        if len(_dedup_store) > _MAX_DEDUP_KEYS:
+            # drop oldest keys
+            for k in list(_dedup_store.keys())[:200]:
+                _dedup_store.pop(k, None)
+
+
+    loop = asyncio.get_running_loop()
+    reference_price = None
+    raw_first = signal.get("raw_entry_first")
+    raw_second = signal.get("raw_entry_second")
+    raw_sl = signal.get("raw_sl")
+
+    def _is_short_integer(token: str) -> bool:
+        token = str(token).strip()
+        token_int = token.split(".")[0]
+        # Max 2 digits (ignoring leading zeros) => short token
+        return len(token_int.lstrip("0")) <= 2
+
+    # Decide whether expansion is needed
+    need_reference = (
+        (raw_first is not None and _is_short_integer(raw_first))
+        or (raw_second is not None and _is_short_integer(raw_second))
+        or (raw_sl is not None and _is_short_integer(raw_sl))
+    )
+
+    if need_reference:
+        reference_price = await loop.run_in_executor(None, get_current_reference_price)
+
+    def _expand_if_needed(raw_token: str) -> float:
+        if raw_token is None:
+            raise ValueError("raw_token is None")
+        if _is_short_integer(raw_token) and reference_price is not None:
+            return _expand_short_price(raw_token, reference_price)
+        return float(raw_token)
+
+    entry_first = _expand_if_needed(raw_first)
+    entry_second = _expand_if_needed(raw_second)
+
+    sl_source = "telegram" if raw_sl is not None else "auto_50_pips"
+
+    DEFAULT_SL_PIPS = 50
+    if raw_sl is not None:
+        sl_raw = (
+            _expand_short_price(raw_sl, reference_price)
+            if _is_short_integer(raw_sl) and reference_price is not None
+            else float(raw_sl)
+        )
+        sl_final_expected = (
+            sl_raw - SL_BUFFER * PIP if signal["direction"] == "buy" else sl_raw + SL_BUFFER * PIP
+        )
+        # sl_final_expected above is just for logging; final SL is what executor computes
+    else:
+        if signal["direction"] == "buy":
+            sl_raw = entry_second - (DEFAULT_SL_PIPS - SL_BUFFER) * PIP
+            sl_final_expected = entry_second - DEFAULT_SL_PIPS * PIP
+        else:
+            sl_raw = entry_second + (DEFAULT_SL_PIPS - SL_BUFFER) * PIP
+            sl_final_expected = entry_second + DEFAULT_SL_PIPS * PIP
+
+    signal["entry_first"] = entry_first
+    signal["entry_second"] = entry_second
+    signal["sl"] = sl_raw
+
+    logger.info(
+        "Signal valid direction=%s entry_tp1=%s entry_tp2=%s sl=%s",
+        signal["direction"],
+        signal["entry_first"],
+        signal["entry_second"],
+        signal["sl"],
+    )
+
+    print("Direction:", signal["direction"].upper())
+    print("Reference price:", reference_price)
+    print("Raw entry range:", f"{raw_first}-{raw_second}")
+    print("Entry TP1:", entry_first)
+    print("Entry TP2:", entry_second)
+    print("SL source:", sl_source)
+    print("Raw SL:", raw_sl)
+    print("SL input:", sl_raw)
+    print("Expected final SL:", sl_final_expected)
+    tp1_target = (
+        entry_first + TP1_PIPS * PIP if signal["direction"] == "buy" else entry_first - TP1_PIPS * PIP
+    )
+    tp2_target = (
+        entry_second + TP2_PIPS * PIP if signal["direction"] == "buy" else entry_second - TP2_PIPS * PIP
+    )
+    print("TP1 target:", tp1_target)
+    print("TP2 target:", tp2_target)
+
+    # TEST MODE path
+    if TELEGRAM_TEST_MODE is True:
+        # Reference: MT5 symbol is fixed in mt5_executor.py; do not redefine it here.
+
+        print("[TELEGRAM TEST MODE]")
+
+        print("Signal received and parsed successfully")
+        print(f"Direction: {signal.get('direction', 'Unavailable').upper()}")
+        print(f"Symbol: {MT5_SYMBOL}")
+        print(f"Stop Loss input: {sl_raw}")
+
+        try:
+            loop = asyncio.get_running_loop()
+            check_result = await loop.run_in_executor(
+                None,
+                check_orders,
+                signal["direction"],
+                signal["entry_first"],
+                signal["entry_second"],
+                signal["sl"],
+            )
+        except Exception:
+            logger.exception("check_orders failed")
+            print("[MT5 ORDER_CHECK ONLY]")
+            print("No order will be sent")
+            return
+
+        print("[MT5 ORDER_CHECK ONLY]")
+        print("No order will be sent")
+        # Output ringkasan MT5 order_check done above, then return (TEST MODE)
+
+
+        def _u(x):
+            return x if x is not None else "Unavailable"
+
+        broker = check_result.get("broker") if isinstance(check_result, dict) else None
+
+        print("Overall result:")
+        print(f"Symbol: {_u(check_result.get('symbol') if isinstance(check_result, dict) else None)}")
+        print(f"Direction: {_u(check_result.get('direction') if isinstance(check_result, dict) else None)}")
+        print(f"Entry: {_u(check_result.get('entry') if isinstance(check_result, dict) else None)}")
+        print(f"Stop Loss: {_u(check_result.get('sl') if isinstance(check_result, dict) else None)}")
+        print(f"Current Bid: {_u(check_result.get('current_bid') if isinstance(check_result, dict) else None)}")
+        print(f"Current Ask: {_u(check_result.get('current_ask') if isinstance(check_result, dict) else None)}")
+        print(f"Lot per order: {_u(check_result.get('volume') if isinstance(check_result, dict) else None)}")
+        print(f"Total planned lot: {_u(check_result.get('total_volume') if isinstance(check_result, dict) else None)}")
+        print(f"Trade stops level: {_u(broker.get('trade_stops_level') if isinstance(broker, dict) else None)}")
+        print(f"Minimum distance: {_u(broker.get('minimum_distance') if isinstance(broker, dict) else None)}")
+        print(f"Volume min: {_u(broker.get('volume_min') if isinstance(broker, dict) else None)}")
+        print(f"Volume max: {_u(broker.get('volume_max') if isinstance(broker, dict) else None)}")
+        print(f"Volume step: {_u(broker.get('volume_step') if isinstance(broker, dict) else None)}")
+        print(f"Error: {_u(check_result.get('error') if isinstance(check_result, dict) else None)}")
+
+        for order in (check_result.get("orders", []) if isinstance(check_result, dict) else []):
+            req = order.get("request") if isinstance(order, dict) else None
+            print("Order:")
+            print(f"Type: {_u(req.get('type') if isinstance(req, dict) else None)}")
+            print(f"Price: {_u(req.get('price') if isinstance(req, dict) else None)}")
+            print(f"SL: {_u(req.get('sl') if isinstance(req, dict) else None)}")
+            print(f"TP: {_u(req.get('tp') if isinstance(req, dict) else None)}")
+            print(f"Volume: {_u(req.get('volume') if isinstance(req, dict) else None)}")
+            print(f"Checked: {_u(order.get('checked') if isinstance(order, dict) else None)}")
+            print(f"Result: {_u('OK' if order.get('ok') is True else 'FAIL' if order.get('ok') is False else None) if isinstance(order, dict) else 'Unavailable'}")
+            print(f"Retcode: {_u(order.get('retcode') if isinstance(order, dict) else None)}")
+            print(f"Comment: {_u(order.get('comment') if isinstance(order, dict) else None)}")
+            print(f"Error: {_u(order.get('error') if isinstance(order, dict) else None)}")
+
+        return
+
+    # Real execution path
+    direction = signal["direction"]
+    sl = signal["sl"]
+
+    print("[REAL MT5 EXECUTION]")
+
+    print(f"Direction: {direction.upper()}")
+    print(f"Symbol: {MT5_SYMBOL}")
+    print(f"Entry first: {signal['entry_first']}")
+    print(f"Entry second: {signal['entry_second']}")
+
+    print(f"Stop Loss: {sl}")
+
+    loop = asyncio.get_running_loop()
+    try:
+        tickets = await loop.run_in_executor(
+            None,
+            place_orders,
+            direction,
+            signal["entry_first"],
+            signal["entry_second"],
+            sl,
+        )
+    except Exception:
+        logger.exception("Gagal mengirim order ke MT5.")
+        return
+
+    print(f"MT5 returned tickets: {tickets}")
+
+    if len(tickets) >= 2:
+        insert_order(tickets[0], tickets[1], direction, signal["entry_first"], signal["entry_second"])
+
+        logger.info("Two pending orders placed successfully")
+    elif len(tickets) == 1:
+        logger.warning("Partial failure: only 1 pending order placed tickets=%s", tickets)
+    else:
+        logger.warning("No MT5 orders were placed")
+
+
+
+async def main():
+    """Start Telegram auth and listen until disconnected."""
+    init_db()
+    await client.start(phone=PHONE)
+
+    me = await client.get_me()
+    username = me.username or " ".join(
+        part for part in (me.first_name, me.last_name) if part
+    )
+    logger.info("Logged in to Telegram as %s", username or me.id)
+    logger.info("Mendengarkan sinyal dari chat ID: %s", SOURCE_CHAT_ID)
+
+    await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
