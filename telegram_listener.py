@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 API_ID = 37673990  # API ID from https://my.telegram.org
 API_HASH = "a9a7c7a933318f577f7d16aeb05a63db"  # API hash from https://my.telegram.org
 PHONE = "+6281229995423"  # Telegram phone number with country code
-SOURCE_CHAT_ID = 7955628010  # Signal channel/group/chat ID from cari_chat_id.py
+SOURCE_CHAT_ID = -1003511779760  # Signal channel/group/chat ID from cari_chat_id.py
 
 # False = aktifkan pengiriman pending order nyata ke MT5 (real execution)
 TELEGRAM_TEST_MODE = False
@@ -222,7 +222,6 @@ def _build_order_plan(signal: dict, reference_price: float | None) -> dict:
         "sl_source": sl_source,
         "tp1_target": tp1_target,
         "tp2_target": tp2_target,
-        "tp3_target": None,
     }
 
 
@@ -280,7 +279,6 @@ async def _handle_sl_update(sl_update: dict):
     print("Latest active order group id:", order_group.get("id"))
     print("TP1 ticket:", order_group.get("ticket_tp1"))
     print("TP2 ticket:", order_group.get("ticket_tp2"))
-    print("TP3 ticket:", order_group.get("ticket_tp3"))
 
     if TELEGRAM_TEST_MODE is True:
         print("[TELEGRAM TEST MODE]")
@@ -291,7 +289,6 @@ async def _handle_sl_update(sl_update: dict):
                 "id": order_group.get("id"),
                 "ticket_tp1": order_group.get("ticket_tp1"),
                 "ticket_tp2": order_group.get("ticket_tp2"),
-                "ticket_tp3": order_group.get("ticket_tp3"),
                 "new_sl": final_sl,
             },
         )
@@ -320,8 +317,6 @@ async def _handle_sl_update(sl_update: dict):
         )
 
 
-# Manual parser checks for this no-framework repo. These document the expected
-# pure-function behavior without starting Telegram or MT5 loops.
 PARSER_MANUAL_CHECKS = (
     "SELL 4566-4569 SL 4574 -> sell, entries 4566/4566, SL 4574",
     "SEL 4566-4569 SL 4574 -> sell, entries 4566/4566, SL 4574",
@@ -379,7 +374,7 @@ async def handle_signal(event):
     signal.update(order_plan)
 
     logger.info(
-        "Signal valid direction=%s raw_range=%s expanded_range=%s mode=%s entry_first=%s entry_second=%s entry_third=%s sl_source=%s final_sl=%s tp1=%s tp2=%s tp3=%s",
+        "Signal valid direction=%s raw_range=%s expanded_range=%s mode=%s entry_first=%s entry_second=%s entry_third=%s sl_source=%s final_sl=%s tp1=%s tp2=%s tp3=NO TP",
         signal["direction"],
         signal.get("raw_range"),
         signal["expanded_range"],
@@ -391,7 +386,6 @@ async def handle_signal(event):
         signal["sl"],
         signal["tp1_target"],
         signal["tp2_target"],
-        "NO TP",
     )
 
     print("Direction:", signal["direction"].upper())
@@ -405,8 +399,8 @@ async def handle_signal(event):
     print("SL source:", signal["sl_source"])
     print("Raw SL:", raw_sl)
     print("Final SL sent to MT5:", signal["sl"])
-    print("Layer 1 / TG-TP1: TP 50 pips target:", signal["tp1_target"])
-    print("Layer 2 / TG-TP2: TP 100 pips target:", signal["tp2_target"])
+    print("TP1 target:", signal["tp1_target"])
+    print("TP2 target:", signal["tp2_target"])
     print("Layer 3 / TG-NO-TP: NO TP")
 
     # TEST MODE path
@@ -521,8 +515,17 @@ async def handle_signal(event):
 
         logger.info("Three pending orders placed successfully")
     elif len(tickets) >= 2:
-        insert_order(tickets[0], tickets[1], direction, signal["entry_first"], signal["entry_second"])
-        logger.warning("Partial failure: only 2 pending orders placed tickets=%s", tickets)
+        insert_order(
+            tickets[0],
+            tickets[1],
+            direction,
+            signal["entry_first"],
+            signal["entry_second"],
+            ticket_tp3=None,
+            entry_tp3=signal["entry_third"],
+        )
+
+        logger.info("Two pending orders placed successfully")
     elif len(tickets) == 1:
         logger.warning("Partial failure: only 1 pending order placed tickets=%s", tickets)
     else:

@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MT5_LOGIN = 371836460  # Your MT5 account login number from your broker
+MT5_LOGIN = 371863329  # Your MT5 account login number from your broker
 MT5_PASSWORD = "sw34LOG2311@"  # Your MT5 account password
 MT5_SERVER = "ValetaxIntl-Live2"  # Your MT5 broker server name exactly as shown in MT5
 
