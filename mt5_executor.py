@@ -689,6 +689,249 @@ def _send_sl_update_request(request: dict) -> dict:
     }
 
 
+def _cancel_result_template(label, ticket, reason=None) -> dict:
+    return {
+        "label": label,
+        "target": "pending_order",
+        "db_ticket": ticket,
+        "mt5_ticket": None,
+        "reason": reason,
+        "ok": False,
+        "status": "not_sent",
+        "retcode": None,
+        "comment": None,
+        "error": None,
+    }
+
+
+def _cancel_pending_order_with_active_connection(ticket, reason=None, label=None) -> dict:
+    result = _cancel_result_template(label, ticket, reason=reason)
+
+    ticket_int = _to_int_or_none(ticket)
+    if ticket_int is None:
+        result["status"] = "missing_ticket"
+        result["error"] = "DB ticket is empty or invalid"
+        return result
+
+    result["db_ticket"] = ticket_int
+
+    active_position = _find_position_for_order_ticket(ticket_int)
+    if active_position is not None:
+        result["target"] = "position"
+        result["mt5_ticket"] = getattr(active_position, "ticket", None)
+        result["status"] = "active_position_skip"
+        result["error"] = "Ticket has an active position; pending cancellation skipped"
+        logger.warning(
+            "Pending cancel skipped: ticket=%s reason=%s active_position_ticket=%s",
+            ticket_int,
+            reason,
+            result["mt5_ticket"],
+        )
+        return result
+
+    orders = mt5.orders_get(ticket=ticket_int)
+    if orders is None:
+        result["status"] = "orders_get_failed"
+        result["error"] = f"orders_get failed: {mt5.last_error()}"
+        logger.error("Pending cancel lookup failed ticket=%s error=%s", ticket_int, result["error"])
+        return result
+
+    if not orders:
+        result["ok"] = True
+        result["status"] = "already_gone"
+        logger.info("Pending cancel skipped: ticket=%s already gone reason=%s", ticket_int, reason)
+        return result
+
+    pending_order = None
+    for order in orders:
+        if getattr(order, "ticket", None) == ticket_int:
+            pending_order = order
+            break
+
+    if pending_order is None:
+        result["ok"] = True
+        result["status"] = "already_gone"
+        logger.info("Pending cancel skipped: ticket=%s no exact order match reason=%s", ticket_int, reason)
+        return result
+
+    result["mt5_ticket"] = ticket_int
+
+    if not _matches_bot_trade(pending_order):
+        result["status"] = "not_bot_order"
+        result["error"] = (
+            f"Order does not match bot symbol/magic: "
+            f"symbol={getattr(pending_order, 'symbol', None)} "
+            f"magic={getattr(pending_order, 'magic', None)}"
+        )
+        logger.warning(
+            "Pending cancel skipped: ticket=%s reason=%s %s",
+            ticket_int,
+            reason,
+            result["error"],
+        )
+        return result
+
+    request = {
+        "action": mt5.TRADE_ACTION_REMOVE,
+        "order": ticket_int,
+        "symbol": SYMBOL,
+        "magic": MAGIC,
+        "comment": str(reason or "TG-CANCEL")[:31],
+        "deviation": SLIPPAGE,
+    }
+
+    send_result = mt5.order_send(request)
+    if send_result is None:
+        result["status"] = "send_failed"
+        result["error"] = f"order_send returned None: {mt5.last_error()}"
+        logger.error(
+            "Pending cancel failed: ticket=%s reason=%s error=%s request=%s",
+            ticket_int,
+            reason,
+            result["error"],
+            request,
+        )
+        return result
+
+    retcode = getattr(send_result, "retcode", None)
+    comment = getattr(send_result, "comment", None)
+    ok = _success_retcode(retcode)
+
+    result.update(
+        {
+            "ok": ok,
+            "status": "cancelled" if ok else "send_failed",
+            "retcode": retcode,
+            "comment": comment,
+            "error": None if ok else f"order_send failed: {mt5.last_error()}",
+        }
+    )
+
+    if ok:
+        logger.info("Pending order cancelled: ticket=%s reason=%s retcode=%s", ticket_int, reason, retcode)
+    else:
+        logger.error(
+            "Pending cancel failed: ticket=%s reason=%s retcode=%s comment=%s error=%s request=%s",
+            ticket_int,
+            reason,
+            retcode,
+            comment,
+            result["error"],
+            request,
+        )
+
+    return result
+
+
+@_with_mt5_lock
+def cancel_pending_order(ticket, reason=None) -> dict:
+    """Cancel one pending order ticket without touching active positions."""
+    result = _cancel_result_template(None, ticket, reason=reason)
+
+    try:
+        if connect() is not True:
+            result["status"] = "connect_failed"
+            result["error"] = "MT5 connection failed"
+            return result
+
+        if not mt5.symbol_select(SYMBOL, True):
+            result["status"] = "symbol_select_failed"
+            result["error"] = f"Could not select symbol {SYMBOL}: {mt5.last_error()}"
+            return result
+
+        return _cancel_pending_order_with_active_connection(ticket, reason=reason)
+
+    except Exception as exc:
+        result["status"] = "exception"
+        result["error"] = str(exc)
+        logger.exception("Pending cancel exception ticket=%s reason=%s", ticket, reason)
+        return result
+
+    finally:
+        disconnect()
+
+
+@_with_mt5_lock
+def cancel_pending_order_group(order_row, reason=None) -> dict:
+    """Cancel all pending tickets in a DB order group without touching positions."""
+    order_group_id = order_row.get("id") if isinstance(order_row, dict) else None
+    result = {
+        "ok": False,
+        "order_group_id": order_group_id,
+        "symbol": SYMBOL,
+        "magic": MAGIC,
+        "reason": reason,
+        "cancellations": [],
+        "error": None,
+    }
+
+    try:
+        if connect() is not True:
+            result["error"] = "MT5 connection failed"
+            return result
+
+        if not mt5.symbol_select(SYMBOL, True):
+            result["error"] = f"Could not select symbol {SYMBOL}: {mt5.last_error()}"
+            return result
+
+        ticket_targets = (
+            ("TG-TP1", "ticket_tp1"),
+            ("TG-TP2", "ticket_tp2"),
+            (TP3_COMMENT, "ticket_tp3"),
+        )
+        for label, ticket_key in ticket_targets:
+            ticket = order_row.get(ticket_key) if isinstance(order_row, dict) else None
+            if ticket is None:
+                result["cancellations"].append(
+                    {
+                        "label": label,
+                        "target": "pending_order",
+                        "db_ticket": None,
+                        "mt5_ticket": None,
+                        "reason": reason,
+                        "ok": True,
+                        "status": "skipped_no_ticket",
+                        "retcode": None,
+                        "comment": None,
+                        "error": None,
+                    }
+                )
+                continue
+
+            cancellation = _cancel_pending_order_with_active_connection(
+                ticket,
+                reason=reason,
+                label=label,
+            )
+            result["cancellations"].append(cancellation)
+
+        result["ok"] = all(
+            cancellation.get("ok") is True
+            for cancellation in result["cancellations"]
+        )
+
+        logger.info(
+            "Pending order group cancel complete order_group_id=%s ok=%s reason=%s cancellations=%s",
+            order_group_id,
+            result["ok"],
+            reason,
+            result["cancellations"],
+        )
+        return result
+
+    except Exception as exc:
+        result["error"] = str(exc)
+        logger.exception(
+            "Pending order group cancel exception order_group_id=%s reason=%s",
+            order_group_id,
+            reason,
+        )
+        return result
+
+    finally:
+        disconnect()
+
+
 def _update_pending_order_sl(label: str, order, new_sl: float) -> dict:
     mt5_ticket = getattr(order, "ticket", None)
     existing_tp = _tp_for_sl_update(label, order)
