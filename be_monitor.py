@@ -62,10 +62,11 @@ TP2_COMMENT = "TG-TP2"
 TP3_COMMENT = "TG-NO-TP"
 BE_COMMENT = "TG-TP2-BE"
 BE_TP3_COMMENT = "TG-NO-TP-BE"
-NEAR_ENTRY_MIN_PIPS = 5
-NEAR_ENTRY_MAX_PIPS = 10
-MISS_ENTRY_TP1_PIPS = TP1_PIPS
+NEAR_ENTRY_MIN_PIPS = 0
+NEAR_ENTRY_MAX_PIPS = 20
+MISS_ENTRY_RUNAWAY_CANCEL_PIPS = TP1_PIPS
 MISSED_ENTRY_CANCEL_REASON = "missed_entry_reached_tp1_after_near_entry"
+MISS_ENTRY_RUNAWAY_CANCEL_REASON = "missed_entry_runaway_without_fill"
 
 
 def connect():
@@ -466,27 +467,27 @@ def _cleanup_state_log_payload(ticket_states: list[dict]) -> list[dict]:
 
 def _runaway_tp1_reached(direction: str, current_price: float, entry: float) -> bool:
     if direction == "buy":
-        return current_price >= entry + MISS_ENTRY_TP1_PIPS * PIP
+        return current_price >= entry + MISS_ENTRY_RUNAWAY_CANCEL_PIPS * PIP
     if direction == "sell":
-        return current_price <= entry - MISS_ENTRY_TP1_PIPS * PIP
+        return current_price <= entry - MISS_ENTRY_RUNAWAY_CANCEL_PIPS * PIP
     return False
 
 
-def _attempt_missed_entry_cleanup(order_row: dict, all_positions: list) -> bool:
+def _attempt_missed_entry_cleanup(order_row: dict, all_positions: list) -> str | None:
     order_id = order_row["id"]
 
     if int(order_row.get("pending_cancelled") or 0) == 1:
         logger.info("order_id=%s: missed-entry cleanup skip: already marked cancelled.", order_id)
-        return False
+        return None
 
     if int(order_row.get("be_moved") or 0) == 1:
         logger.info("order_id=%s: missed-entry cleanup skip: BE already moved.", order_id)
-        return False
+        return None
 
     direction = str(order_row.get("direction", "")).lower()
     if direction not in {"buy", "sell"}:
         logger.info("order_id=%s: missed-entry cleanup skip: invalid direction=%s", order_id, direction)
-        return False
+        return None
 
     legacy_entry = order_row.get("entry")
     entry = float(order_row.get("entry_tp1") if order_row.get("entry_tp1") is not None else legacy_entry)
@@ -503,7 +504,7 @@ def _attempt_missed_entry_cleanup(order_row: dict, all_positions: list) -> bool:
             order_id,
             _cleanup_state_log_payload(ticket_states),
         )
-        return False
+        return None
 
     tick = mt5.symbol_info_tick(SYMBOL)
     bid = getattr(tick, "bid", None) if tick else None
@@ -517,11 +518,13 @@ def _attempt_missed_entry_cleanup(order_row: dict, all_positions: list) -> bool:
             bid,
             ask,
         )
-        return False
+        return None
 
     distance_to_entry_pips = abs(float(current_price) - entry) / PIP
-    if NEAR_ENTRY_MIN_PIPS <= distance_to_entry_pips <= NEAR_ENTRY_MAX_PIPS:
+    near_entry_seen = int(order_row.get("near_entry_seen") or 0) == 1
+    if distance_to_entry_pips <= NEAR_ENTRY_MAX_PIPS:
         mark_near_entry_seen(order_id, distance_to_entry_pips)
+        near_entry_seen = True
         logger.info(
             "order_id=%s: missed-entry near-entry seen. direction=%s entry=%s current_price=%s distance_pips=%.2f previous_min_distance=%s states=%s",
             order_id,
@@ -533,21 +536,21 @@ def _attempt_missed_entry_cleanup(order_row: dict, all_positions: list) -> bool:
             _cleanup_state_log_payload(ticket_states),
         )
 
-    near_entry_seen = int(order_row.get("near_entry_seen") or 0) == 1
     runaway_reached = _runaway_tp1_reached(direction, float(current_price), entry)
-    if not near_entry_seen:
-        if runaway_reached:
-            logger.info(
-                "order_id=%s: missed-entry cleanup not armed: TP1 runaway reached before near-entry was seen. direction=%s entry=%s current_price=%s",
-                order_id,
-                direction,
-                entry,
-                current_price,
-            )
-        return False
-
     if not runaway_reached:
-        return False
+        return None
+
+    if not near_entry_seen:
+        logger.info(
+            "order_id=%s: missed-entry runaway cleanup candidate: near_entry_seen=0 direction=%s entry=%s current_price=%s runaway_cancel_pips=%s states=%s",
+            order_id,
+            direction,
+            entry,
+            current_price,
+            MISS_ENTRY_RUNAWAY_CANCEL_PIPS,
+            _cleanup_state_log_payload(ticket_states),
+        )
+        return MISS_ENTRY_RUNAWAY_CANCEL_REASON
 
     logger.info(
         "order_id=%s: missed-entry cleanup candidate: near_entry_seen=1 direction=%s entry=%s current_price=%s tp1_runaway_pips=%s states=%s",
@@ -555,15 +558,16 @@ def _attempt_missed_entry_cleanup(order_row: dict, all_positions: list) -> bool:
         direction,
         entry,
         current_price,
-        MISS_ENTRY_TP1_PIPS,
+        MISS_ENTRY_RUNAWAY_CANCEL_PIPS,
         _cleanup_state_log_payload(ticket_states),
     )
-    return True
+    return MISSED_ENTRY_CANCEL_REASON
 
 
-def _cancel_missed_entry_candidate(order_row: dict) -> None:
+def _cancel_missed_entry_candidate(order_row: dict, reason: str | None = None) -> None:
     order_id = order_row.get("id")
-    result = cancel_pending_order_group(order_row, reason=MISSED_ENTRY_CANCEL_REASON)
+    cancel_reason = reason or MISSED_ENTRY_CANCEL_REASON
+    result = cancel_pending_order_group(order_row, reason=cancel_reason)
 
     for cancellation in result.get("cancellations", []):
         logger.info(
@@ -578,11 +582,17 @@ def _cancel_missed_entry_candidate(order_row: dict) -> None:
         )
 
     if result.get("ok") is True:
-        mark_pending_cancelled(order_id, MISSED_ENTRY_CANCEL_REASON)
-        logger.info(
-            "order_id=%s: missed-entry cleanup complete and DB marked cancelled.",
-            order_id,
-        )
+        mark_pending_cancelled(order_id, cancel_reason)
+        if cancel_reason == MISS_ENTRY_RUNAWAY_CANCEL_REASON:
+            logger.info(
+                "order_id=%s: missed-entry runaway cleanup complete and DB marked cancelled.",
+                order_id,
+            )
+        else:
+            logger.info(
+                "order_id=%s: missed-entry cleanup complete and DB marked cancelled.",
+                order_id,
+            )
         return
 
     logger.error(
@@ -802,8 +812,9 @@ def monitor_loop():
                         # Only consider bot-tagged positions; pairing is still anchored by DB tickets.
                         for order_row in orders:
                             try:
-                                if _attempt_missed_entry_cleanup(order_row, all_positions):
-                                    cleanup_candidates.append(order_row)
+                                cancel_reason = _attempt_missed_entry_cleanup(order_row, all_positions)
+                                if cancel_reason:
+                                    cleanup_candidates.append((order_row, cancel_reason))
                                     continue
 
                                 if not tp1_positions:
@@ -822,9 +833,9 @@ def monitor_loop():
                     finally:
                         disconnect()
 
-                for order_row in cleanup_candidates:
+                for order_row, cancel_reason in cleanup_candidates:
                     try:
-                        _cancel_missed_entry_candidate(order_row)
+                        _cancel_missed_entry_candidate(order_row, cancel_reason)
                     except Exception:
                         logger.exception(
                             "Missed-entry cleanup exception for order_id=%s",

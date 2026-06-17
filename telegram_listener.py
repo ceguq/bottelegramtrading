@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 API_ID = 37673990  # API ID from https://my.telegram.org
 API_HASH = "a9a7c7a933318f577f7d16aeb05a63db"  # API hash from https://my.telegram.org
 PHONE = "+6281229995423"  # Telegram phone number with country code
-SOURCE_CHAT_ID = 7955628010  # Signal channel/group/chat ID from cari_chat_id.py
+SOURCE_CHAT_ID = -1003511779760  # Signal channel/group/chat ID from cari_chat_id.py
 
 # False = aktifkan pengiriman pending order nyata ke MT5 (real execution)
 TELEGRAM_TEST_MODE = False
@@ -46,6 +46,7 @@ PIP = 0.1  # 1 pip = 0.1 for XAUUSD
 TP1_PIPS = 50  # Pips for Order 1 take profit
 TP2_PIPS = 100  # Pips for Order 2 take profit
 SL_BUFFER = 10  # Extra pips added to the raw signal SL
+EMERGENCY_SL_PIPS = 60  # Final fallback SL distance when signal has no SL
 MAGIC = 20250611  # Magic number to identify orders from this bot
 SLIPPAGE = 20  # Maximum allowed slippage/deviation in points
 MONITOR_INTERVAL = 5  # Seconds between each breakeven monitor check
@@ -122,6 +123,32 @@ def _expand_if_needed(raw_token: str, reference_price: float | None) -> float:
     return float(raw_token)
 
 
+def _apply_chat_sl_buffer(direction: str, chat_sl: float) -> float:
+    if direction == "buy":
+        return chat_sl - SL_BUFFER * PIP
+    if direction == "sell":
+        return chat_sl + SL_BUFFER * PIP
+    raise ValueError(f"Unsupported direction for SL buffer: {direction}")
+
+
+def _apply_emergency_sl(direction: str, entry: float) -> float:
+    if direction == "buy":
+        return entry - EMERGENCY_SL_PIPS * PIP
+    if direction == "sell":
+        return entry + EMERGENCY_SL_PIPS * PIP
+    raise ValueError(f"Unsupported direction for emergency SL: {direction}")
+
+
+def _validate_final_sl(direction: str, final_sl: float, entry: float) -> None:
+    if direction == "buy" and final_sl < entry:
+        return
+    if direction == "sell" and final_sl > entry:
+        return
+    raise ValueError(
+        f"Final SL invalid for {direction}: final_sl={final_sl}, entry={entry}"
+    )
+
+
 def parse_signal(text: str) -> dict | None:
     """Parse a signal into direction and raw (possibly short) entry range + SL.
 
@@ -191,13 +218,15 @@ def _build_order_plan(signal: dict, reference_price: float | None) -> dict:
         selected_entry = expanded_high
         selected_entry_mode = "BUY uses higher range"
 
-    sl_source = "telegram" if raw_sl is not None else "emergency_50_pips"
+    expanded_sl = None
+    sl_source = "chat_sl_buffered" if raw_sl is not None else "emergency_60_pips"
     if raw_sl is not None:
-        final_sl = _expand_if_needed(raw_sl, reference_price)
-    elif direction == "buy":
-        final_sl = selected_entry - 50 * PIP
+        expanded_sl = _expand_if_needed(raw_sl, reference_price)
+        final_sl = _apply_chat_sl_buffer(direction, expanded_sl)
     else:
-        final_sl = selected_entry + 50 * PIP
+        final_sl = _apply_emergency_sl(direction, selected_entry)
+
+    _validate_final_sl(direction, final_sl, selected_entry)
 
     tp1_target = (
         selected_entry + TP1_PIPS * PIP
@@ -220,6 +249,7 @@ def _build_order_plan(signal: dict, reference_price: float | None) -> dict:
         "entry_third": selected_entry,
         "sl": final_sl,
         "sl_source": sl_source,
+        "expanded_sl": expanded_sl,
         "tp1_target": tp1_target,
         "tp2_target": tp2_target,
     }
@@ -250,31 +280,62 @@ def _is_duplicate_event(event) -> bool:
 async def _handle_sl_update(sl_update: dict):
     loop = asyncio.get_running_loop()
     raw_sl = sl_update["raw_sl"]
+    order_group = get_latest_active_order()
     reference_price = None
+
+    if order_group is None:
+        logger.warning("No active order group found for SL follow-up update.")
+        print("[SL FOLLOW-UP UPDATE]")
+        print("SL source: chat_sl_buffered")
+        print("Raw SL:", raw_sl)
+        print("No active order group found; no MT5 update sent.")
+        return
+
+    direction = str(order_group.get("direction", "")).lower()
+    if direction not in {"buy", "sell"}:
+        logger.error("Invalid active order direction for SL follow-up: %s", direction)
+        print("[SL FOLLOW-UP UPDATE]")
+        print("SL source: chat_sl_buffered")
+        print("Raw SL:", raw_sl)
+        print("Invalid active order direction; no MT5 update sent.")
+        return
 
     if _is_short_integer(raw_sl):
         reference_price = await loop.run_in_executor(None, get_current_reference_price)
 
-    final_sl = _expand_if_needed(raw_sl, reference_price)
-    order_group = get_latest_active_order()
+    expanded_sl = _expand_if_needed(raw_sl, reference_price)
+    final_sl = _apply_chat_sl_buffer(direction, expanded_sl)
+    entry_reference = float(
+        order_group.get("entry_tp1")
+        if order_group.get("entry_tp1") is not None
+        else order_group.get("entry")
+    )
+    try:
+        _validate_final_sl(direction, final_sl, entry_reference)
+    except ValueError as exc:
+        logger.error("SL follow-up rejected: %s", exc)
+        print("[SL FOLLOW-UP UPDATE]")
+        print("SL source: chat_sl_buffered")
+        print("Raw SL:", raw_sl)
+        print("Expanded raw SL:", expanded_sl)
+        print("Final SL sent to MT5:", final_sl)
+        print("SL update rejected:", exc)
+        return
 
     logger.info(
-        "SL follow-up parsed raw_sl=%s reference_price=%s final_sl=%s",
+        "SL follow-up parsed raw_sl=%s expanded_sl=%s reference_price=%s sl_source=chat_sl_buffered final_sl=%s",
         raw_sl,
+        expanded_sl,
         reference_price,
         final_sl,
     )
 
     print("[SL FOLLOW-UP UPDATE]")
-    print("SL source: followup_update")
+    print("SL source: chat_sl_buffered")
     print("Reference price:", reference_price)
     print("Raw SL:", raw_sl)
+    print("Expanded raw SL:", expanded_sl)
     print("Final SL sent to MT5:", final_sl)
-
-    if order_group is None:
-        logger.warning("No active order group found for SL follow-up update.")
-        print("No active order group found; no MT5 update sent.")
-        return
 
     print("Latest active order group id:", order_group.get("id"))
     print("TP1 ticket:", order_group.get("ticket_tp1"))
@@ -318,14 +379,14 @@ async def _handle_sl_update(sl_update: dict):
 
 
 PARSER_MANUAL_CHECKS = (
-    "SELL 4566-4569 SL 4574 -> sell, entries 4566/4566, SL 4574",
-    "SEL 4566-4569 SL 4574 -> sell, entries 4566/4566, SL 4574",
-    "BUY 4566-4569 SL 4563 -> buy, entries 4569/4569, SL 4563",
-    "recov sel 56-58 sl 60 with reference 4655 -> sell, entries 4656/4656, SL 4660",
-    "BUY 4566-4569 -> buy, entries 4569/4569, emergency SL 4564",
-    "SELL 4566-4569 -> sell, entries 4566/4566, emergency SL 4571",
+    "SELL 4566-4569 SL 4574 -> sell, entries 4566/4566, buffered SL 4575",
+    "SEL 4566-4569 SL 4574 -> sell, entries 4566/4566, buffered SL 4575",
+    "BUY 4566-4569 SL 4563 -> buy, entries 4569/4569, buffered SL 4562",
+    "recov sel 56-58 sl 60 with reference 4655 -> sell, entries 4656/4656, buffered SL 4661",
+    "BUY 4566-4569 -> buy, entries 4569/4569, emergency SL 4563",
+    "SELL 4566-4569 -> sell, entries 4566/4566, emergency SL 4572",
     "SL 4574 -> follow-up update only",
-    "SL 60 with reference 4655 -> follow-up update only, SL 4660",
+    "SL 60 with reference 4655 -> follow-up update only, buffered by active order direction",
 )
 
 
@@ -370,11 +431,16 @@ async def handle_signal(event):
     if need_reference:
         reference_price = await loop.run_in_executor(None, get_current_reference_price)
 
-    order_plan = _build_order_plan(signal, reference_price)
+    try:
+        order_plan = _build_order_plan(signal, reference_price)
+    except ValueError as exc:
+        logger.error("Signal rejected: %s", exc)
+        print("Signal rejected:", exc)
+        return
     signal.update(order_plan)
 
     logger.info(
-        "Signal valid direction=%s raw_range=%s expanded_range=%s mode=%s entry_first=%s entry_second=%s entry_third=%s sl_source=%s final_sl=%s tp1=%s tp2=%s tp3=NO TP",
+        "Signal valid direction=%s raw_range=%s expanded_range=%s mode=%s entry_first=%s entry_second=%s entry_third=%s raw_sl=%s expanded_sl=%s sl_source=%s final_sl=%s tp1=%s tp2=%s tp3=NO TP",
         signal["direction"],
         signal.get("raw_range"),
         signal["expanded_range"],
@@ -382,6 +448,8 @@ async def handle_signal(event):
         signal["entry_first"],
         signal["entry_second"],
         signal["entry_third"],
+        raw_sl,
+        signal.get("expanded_sl"),
         signal["sl_source"],
         signal["sl"],
         signal["tp1_target"],
@@ -398,6 +466,7 @@ async def handle_signal(event):
     print("Final entry_third:", signal["entry_third"])
     print("SL source:", signal["sl_source"])
     print("Raw SL:", raw_sl)
+    print("Expanded raw SL:", signal.get("expanded_sl"))
     print("Final SL sent to MT5:", signal["sl"])
     print("TP1 target:", signal["tp1_target"])
     print("TP2 target:", signal["tp2_target"])
