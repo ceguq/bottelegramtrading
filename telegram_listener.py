@@ -34,14 +34,14 @@ logger = logging.getLogger(__name__)
 API_ID = 37673990  # API ID from https://my.telegram.org
 API_HASH = "a9a7c7a933318f577f7d16aeb05a63db"  # API hash from https://my.telegram.org
 PHONE = "+6281229995423"  # Telegram phone number with country code
-SOURCE_CHAT_ID = -1003511779760  # Signal channel/group/chat ID from cari_chat_id.py
+SOURCE_CHAT_ID = 7955628010  # Signal channel/group/chat ID from cari_chat_id.py
 
 # False = aktifkan pengiriman pending order nyata ke MT5 (real execution)
 TELEGRAM_TEST_MODE = False
 
 
 
-LOT = 0.01  # Lot size for each pending order
+LOT = 0.05  # Lot size for each pending order
 PIP = 0.1  # 1 pip = 0.1 for XAUUSD
 TP1_PIPS = 50  # Pips for Order 1 take profit
 TP2_PIPS = 100  # Pips for Order 2 take profit

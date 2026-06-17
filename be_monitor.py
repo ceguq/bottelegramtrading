@@ -44,9 +44,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # IMPORTANT: keep connection credentials as they were in the original be_monitor.py
-MT5_LOGIN = 371863329  # Your MT5 account login number from your broker
+MT5_LOGIN = 2171043269  # real
+#MT5_LOGIN = 371863329  # demo
+
+
 MT5_PASSWORD = "sw34LOG2311@"  # Your MT5 account password
-MT5_SERVER = "ValetaxIntl-Live2"  # Your MT5 broker server name exactly as shown in MT5
+
+
+MT5_SERVER = "ValetaxIntl-Live7"  # real
+#MT5_SERVER = "ValetaxIntl-Live2"  # demo
+
 
 MONITOR_INTERVAL = 5
 

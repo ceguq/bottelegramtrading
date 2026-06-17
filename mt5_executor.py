@@ -39,16 +39,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MT5_LOGIN = 371863329  # Your MT5 account login number from your broker
+MT5_LOGIN = 2171043269  # real
+#MT5_LOGIN = 371863329  # demo
+
 MT5_PASSWORD = "sw34LOG2311@"  # Your MT5 account password
-MT5_SERVER = "ValetaxIntl-Live2"  # Your MT5 broker server name exactly as shown in MT5
+
+MT5_SERVER = "ValetaxIntl-Live7"  # real
+#MT5_SERVER = "ValetaxIntl-Live2"  # demo
 
 # IMPORTANT: set to your Valetax terminal64.exe path.
 # This is a placeholder; update it to match your local installation.
 MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
-SYMBOL = "XAUUSD.vx"  # Broker symbol to trade
-LOT = 0.01  # Lot size for each pending order
+SYMBOL = "XAUUSD.vxc"  # Broker symbol to trade
+LOT = 0.05  # Lot size for each pending order
 PIP = 0.1  # 1 pip = 0.1 for XAUUSD
 TP1_PIPS = 50  # Pips for Order 1 take profit
 TP2_PIPS = 100  # Pips for Order 2 take profit
