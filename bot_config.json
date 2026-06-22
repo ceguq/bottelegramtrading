@@ -1,0 +1,12 @@
+{
+  "lot": 0.01,
+  "pip": 0.1,
+  "tp1_pips": 50,
+  "tp2_pips": 100,
+  "sl_buffer": 10,
+  "emergency_sl_pips": 60,
+  "monitor_interval": 1,
+  "telegram_test_mode": false,
+  "source_chat_id": -1003511779760
+}
+

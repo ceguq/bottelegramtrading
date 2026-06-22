@@ -25,6 +25,9 @@ from mt5_executor import (
     update_sl_for_order_group,
 )
 
+from bot_settings import load_settings
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -36,20 +39,26 @@ API_HASH = "a9a7c7a933318f577f7d16aeb05a63db"  # API hash from https://my.telegr
 PHONE = "+6281229995423"  # Telegram phone number with country code
 SOURCE_CHAT_ID = -1003511779760  # Signal channel/group/chat ID from cari_chat_id.py
 
+# Load safe operational values from bot_config.json via bot_settings.py.
+# IMPORTANT: SOURCE_CHAT_ID must be defined before the @client.on decorator.
+settings = load_settings()
+
+LOT = settings.lot  # Lot size for each pending order
+PIP = settings.pip  # 1 pip = 0.1 for XAUUSD
+TP1_PIPS = settings.tp1_pips  # Pips for Order 1 take profit
+TP2_PIPS = settings.tp2_pips  # Pips for Order 2 take profit
+SL_BUFFER = settings.sl_buffer  # Extra pips added to the raw signal SL
+EMERGENCY_SL_PIPS = settings.emergency_sl_pips  # Final fallback SL distance when signal has no SL
+
 # False = aktifkan pengiriman pending order nyata ke MT5 (real execution)
-TELEGRAM_TEST_MODE = False
+TELEGRAM_TEST_MODE = settings.telegram_test_mode
 
+SOURCE_CHAT_ID = settings.source_chat_id  # Signal channel/group/chat ID from cari_chat_id.py
 
-
-LOT = 0.05  # Lot size for each pending order
-PIP = 0.1  # 1 pip = 0.1 for XAUUSD
-TP1_PIPS = 50  # Pips for Order 1 take profit
-TP2_PIPS = 100  # Pips for Order 2 take profit
-SL_BUFFER = 10  # Extra pips added to the raw signal SL
-EMERGENCY_SL_PIPS = 60  # Final fallback SL distance when signal has no SL
 MAGIC = 20250611  # Magic number to identify orders from this bot
 SLIPPAGE = 20  # Maximum allowed slippage/deviation in points
 MONITOR_INTERVAL = 5  # Seconds between each breakeven monitor check
+
 
 SESSION_NAME = "xauusd_signal_session"  # Local Telethon session file name
 

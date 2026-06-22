@@ -8,3 +8,8 @@ active_orders.db
 logs/
 *.log
 active_orders.mt5.lock
+run_bot.stack.lock
+
+active_orders*.db
+*.db-wal
+*.db-shm

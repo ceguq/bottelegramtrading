@@ -52,11 +52,22 @@ MT5_SERVER = "ValetaxIntl-Live7"  # real
 MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 SYMBOL = "XAUUSD.vxc"  # Broker symbol to trade
-LOT = 0.05  # Lot size for each pending order
-PIP = 0.1  # 1 pip = 0.1 for XAUUSD
-TP1_PIPS = 50  # Pips for Order 1 take profit
-TP2_PIPS = 100  # Pips for Order 2 take profit
-SL_BUFFER = 10  # Extra pips added to the raw signal SL
+
+# Safe operational settings loaded from bot_config.json (via bot_settings.py).
+# Credentials and identifiers (MT5/Telegram) remain in code.
+try:
+    from bot_settings import load_settings
+
+    _settings = load_settings()
+    LOT = _settings.lot  # Lot size for each pending order
+    PIP = _settings.pip  # 1 pip = configured for XAUUSD
+    TP1_PIPS = _settings.tp1_pips  # Pips for Order 1 take profit
+    TP2_PIPS = _settings.tp2_pips  # Pips for Order 2 take profit
+    SL_BUFFER = _settings.sl_buffer  # Extra pips added to the raw signal SL
+except Exception as _cfg_exc:
+    # Fail-fast at import time: wrong trading config should not result in silent defaults.
+    raise
+
 MAGIC = 20250611  # Magic number to identify orders from this bot
 SLIPPAGE = 20  # Maximum allowed slippage/deviation in points
 MONITOR_INTERVAL = 5  # Seconds between each breakeven monitor check
@@ -780,7 +791,6 @@ def _cancel_pending_order_with_active_connection(ticket, reason=None, label=None
         "order": ticket_int,
         "symbol": SYMBOL,
         "magic": MAGIC,
-        "comment": str(reason or "TG-CANCEL")[:31],
         "deviation": SLIPPAGE,
     }
 
