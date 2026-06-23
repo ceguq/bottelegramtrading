@@ -254,7 +254,13 @@ def check_orders(
     entry_first: float,
     entry_second: float,
     sl_raw: float,
+    lot_override: float | None = None,
 ) -> dict:
+    effective_lot = LOT if lot_override is None else float(lot_override)
+    if not (effective_lot > 0):
+        raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
+
+
     result_data = {
         "ok": False,
         "symbol": SYMBOL,
@@ -266,8 +272,8 @@ def check_orders(
         "entry_third": entry_second,
         "current_bid": None,
         "current_ask": None,
-        "volume": LOT,
-        "total_volume": LOT * 3,
+        "volume": effective_lot,
+        "total_volume": effective_lot * 3,
         "broker": None,
         "orders": [],
         "error": None,
@@ -437,7 +443,7 @@ def check_orders(
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": SYMBOL,
-                "volume": LOT,
+                "volume": effective_lot,
                 "type": pending_type,
                 "price": price_level,
                 "sl": sl_actual,
@@ -1197,12 +1203,17 @@ def update_sl_for_order_group(order_group: dict, new_sl: float) -> dict:
 
 
 @_with_mt5_lock
-def place_orders(direction, entry_first, entry_second, sl_raw):
+def place_orders(direction, entry_first, entry_second, sl_raw, lot_override: float | None = None):
     """
     Place three pending orders: two TP layers and one no-TP layer.
 
+
     Returns successful ticket numbers in order: [ticket_tp1, ticket_tp2, ticket_tp3].
     """
+    effective_lot = LOT if lot_override is None else float(lot_override)
+    if not (effective_lot > 0):
+        raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
+
     tickets = []
 
     try:
@@ -1243,7 +1254,7 @@ def place_orders(direction, entry_first, entry_second, sl_raw):
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": SYMBOL,
-                "volume": LOT,
+                "volume": effective_lot,
                 "type": order_type,
                 "price": order_entry,
                 "sl": sl_actual,
@@ -1268,7 +1279,7 @@ def place_orders(direction, entry_first, entry_second, sl_raw):
                     sl_actual,
                     tp,
                     order_type,
-                    LOT,
+                    effective_lot,
                 )
                 continue
 
