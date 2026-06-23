@@ -287,11 +287,99 @@ def _render_root_page(*, cfg: dict, error: str = "", saved: bool = False) -> str
     <p><button type="submit">Simpan</button></p>
   </form>
 
+  <div style="padding:12px;background:#f8f9fa;border:1px solid #e9ecef;border-radius:10px;max-width:760px;margin:14px 0;">
+    <div style="font-weight:800;margin-bottom:6px;">Layer Settings</div>
+    <div style="color:#333;">
+      Fitur konfigurasi layer akan ditambahkan bertahap. Saat ini order execution masih memakai legacy logic.
+    </div>
+
+    <div style="margin-top:10px;">
+      <button type="button" disabled style="opacity:0.55; cursor:not-allowed;">+ Tambah Layer</button>
+    </div>
+    <div style="margin-top:6px;color:#666;">
+      Tombol ini baru tampilan. Add/remove layer akan diaktifkan pada phase berikutnya.
+    </div>
+
+    <div style="margin-top:10px;padding:10px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">
+      <div style="font-weight:800;margin-bottom:6px;">Layer Settings - Layer 1 (Mock, disabled)</div>
+
+      <div style="margin-top:8px;color:#333;line-height:1.6;">
+        <div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">
+          <input type="checkbox" disabled checked /> <span>enabled</span>
+          <span style="color:#666;">&nbsp;</span>
+        </div>
+
+        <div style="margin-bottom:6px;">name</div>
+        <div style="margin-bottom:10px;">
+          <input type="text" disabled value="L1" />
+        </div>
+
+        <div style="margin-bottom:6px;">lot</div>
+        <div style="margin-bottom:10px;">
+          <input type="text" disabled value="" placeholder="@@LOT@@" />
+        </div>
+
+        <div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">
+          <input type="checkbox" disabled checked /> <span>tp_enabled</span>
+        </div>
+
+        <div style="margin-bottom:6px;">tp_pips</div>
+        <div style="margin-bottom:10px;">
+          <input type="text" disabled value="" placeholder="@@TP1_PIPS@@" />
+        </div>
+
+        <div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">
+          <input type="checkbox" disabled /> <span>be_enabled</span>
+        </div>
+
+        <div style="margin-bottom:6px;">be_trigger_pips</div>
+        <div style="margin-bottom:10px;">
+          <input type="text" disabled value="50" />
+        </div>
+
+        <div style="margin-bottom:6px;">be_offset_pips</div>
+        <div style="margin-bottom:10px;">
+          <input type="text" disabled value="0" />
+        </div>
+
+        <div style="margin-bottom:6px;">comment</div>
+        <div style="margin-bottom:10px;">
+          <input type="text" disabled value="TG-L1" />
+        </div>
+
+        <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">
+          Input ini masih disabled. Penyimpanan layer akan dibuat pada phase berikutnya.
+        </div>
+      </div>
+    </div>
+
+
+    <div style="margin-top:10px;padding:10px;border-radius:8px;border:1px solid #e9ecef;background:#f8f9fa;">
+      <div style="font-weight:800;margin-bottom:6px;">Field yang nanti bisa diatur</div>
+      <ul style="margin:0;padding-left:18px;color:#333;line-height:1.7;">
+        <li>Aktif / nonaktif layer</li>
+        <li>Nama layer</li>
+        <li>Lot per layer</li>
+        <li>TP aktif / nonaktif</li>
+        <li>TP pips</li>
+        <li>BE aktif / nonaktif</li>
+        <li>BE trigger pips</li>
+        <li>BE offset pips</li>
+        <li>Comment order</li>
+      </ul>
+    </div>
+
+    <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">
+      Layer config belum dipakai untuk order sampai phase berikutnya.
+    </div>
+  </div>
+
   <h2>Status</h2>
   <div>
     panel: <code>running</code><br/>
     bot_process_hint: <code>process status only (Phase 3C)</code>
   </div>
+
 
 <h2>Bot Controls</h2>
   <div style="padding:10px;background:#f8f9fa;border:1px solid #e9ecef;margin:10px 0;">
