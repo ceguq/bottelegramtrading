@@ -344,10 +344,35 @@ def _render_layer_card(layer: dict[str, Any], idx: int) -> str:
     )
 
 
+def _default_layer_form_data(raw_cfg: dict) -> dict:
+    """Build default layer data for editable Layer 1 form from legacy config.
+    
+    Derives layer defaults from legacy config fields to avoid validation failures
+    when layer save is wired into POST /config.
+    
+    Args:
+        raw_cfg: raw bot_config.json dict
+        
+    Returns:
+        dict with layer form defaults, using legacy config values where applicable
+    """
+    return {
+        "enabled": True,
+        "name": "L1",
+        "lot": raw_cfg.get("lot", ""),
+        "tp_enabled": True,
+        "tp_pips": raw_cfg.get("tp1_pips", ""),
+        "be_enabled": False,
+        "be_trigger_pips": 50,
+        "be_offset_pips": 0,
+        "comment": "TG-L1",
+    }
+
+
 def _render_layers_section(raw_cfg: dict) -> str:
     raw_layers = raw_cfg.get("layers")
     if not isinstance(raw_layers, list):
-        return _render_editable_layer_form()
+        return _render_editable_layer_form(_default_layer_form_data(raw_cfg))
 
     cards = []
     for item in raw_layers:
@@ -358,7 +383,7 @@ def _render_layers_section(raw_cfg: dict) -> str:
             break
 
     if not cards:
-        return _render_editable_layer_form()
+        return _render_editable_layer_form(_default_layer_form_data(raw_cfg))
 
     return "".join(cards)
 
