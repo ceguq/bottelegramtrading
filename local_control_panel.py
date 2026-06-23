@@ -377,6 +377,78 @@ LAYER_FIELD_NAMES = (
 )
 
 
+def _extract_layers_from_form_qs(parsed: dict) -> list[dict] | None:
+    """
+    Extract layer form fields from raw parse_qs() output.
+    
+    parse_qs() returns {"key": ["value1", "value2"], ...}
+    This function parses bracket notation like "layers[0][name]" into a nested structure.
+    
+    For checkbox hidden field pattern:
+    - Checked: ["false", "true"] -> takes last value "true"
+    - Unchecked: ["false"] -> takes last value "false"
+    
+    Args:
+        parsed: raw parse_qs() result with list values
+        
+    Returns:
+        list of raw layer dicts ordered by index, or None if no layer keys found
+        
+    Raises:
+        ValueError: if layer indices are out of range or field names are invalid
+    """
+    import re
+    
+    # Collect all keys matching layers[idx][fieldname]
+    layer_keys = {k: v for k, v in parsed.items() if k.startswith("layers[")}
+    
+    if not layer_keys:
+        return None
+    
+    # Regex to parse "layers[0][name]" into (0, "name"); also detects negative indices like layers[-1][name]
+    pattern = r"^layers\[(-?\d+)\]\[([^\]]+)\]$"
+    
+    layers_by_idx = {}  # {idx: {field: value, ...}, ...}
+    
+    for key, values in layer_keys.items():
+        match = re.match(pattern, key)
+        if not match:
+            # Skip malformed keys
+            continue
+        
+        idx_str, field_name = match.groups()
+        idx = int(idx_str)
+        
+        # Validate index range
+        if idx < 0 or idx >= MAX_LAYERS:
+            raise ValueError(f"Layer index {idx} out of range [0, {MAX_LAYERS-1}]")
+        
+        # Validate field name is known
+        if field_name not in LAYER_FIELD_NAMES:
+            raise ValueError(f"Unknown layer field: {field_name}")
+        
+        # For checkbox hidden field pattern, take the LAST value from list
+        # Unchecked: ["false"]
+        # Checked: ["false", "true"]
+        value = values[-1] if isinstance(values, list) and values else ""
+        
+        # Add to layer dict
+        if idx not in layers_by_idx:
+            layers_by_idx[idx] = {}
+        
+        layers_by_idx[idx][field_name] = value
+    
+    # If no valid layers collected, return None
+    if not layers_by_idx:
+        return None
+    
+    # Convert to sorted list by index
+    sorted_indices = sorted(layers_by_idx.keys())
+    result = [layers_by_idx[idx] for idx in sorted_indices]
+    
+    return result
+
+
 def _parse_layer_bool(value, field_name: str) -> bool:
     if isinstance(value, bool):
         return value
