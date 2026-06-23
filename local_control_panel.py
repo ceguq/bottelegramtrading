@@ -327,6 +327,140 @@ def _render_layers_section(raw_cfg: dict) -> str:
     return "".join(cards)
 
 
+MAX_LAYERS = 10
+LAYER_FIELD_NAMES = (
+    "name",
+    "enabled",
+    "lot",
+    "tp_enabled",
+    "tp_pips",
+    "be_enabled",
+    "be_trigger_pips",
+    "be_offset_pips",
+    "comment",
+)
+
+
+def _parse_layer_bool(value, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off"):
+            return False
+    raise ValueError(f"{field_name} must be boolean")
+
+
+def _parse_layer_float(value, field_name: str, *, min_value: float | None = None) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be numeric")
+    try:
+        if isinstance(value, str):
+            v = value.strip()
+            num = float(v)
+        else:
+            num = float(value)
+    except Exception as e:
+        raise ValueError(f"{field_name} must be numeric") from e
+
+    if min_value is not None and num < min_value:
+        raise ValueError(f"{field_name} must be >= {min_value}")
+    return num
+
+
+def _parse_layer_int(value, field_name: str, *, min_value: int | None = None) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be integer")
+    try:
+        if isinstance(value, str):
+            v = value.strip()
+            if v == "":
+                raise ValueError
+            num = float(v)
+        else:
+            num = float(value)
+    except Exception as e:
+        raise ValueError(f"{field_name} must be integer") from e
+
+    if not float(num).is_integer():
+        raise ValueError(f"{field_name} must be integer")
+
+    result = int(num)
+    if min_value is not None and result < min_value:
+        raise ValueError(f"{field_name} must be >= {min_value}")
+    return result
+
+
+def _validate_layer_item(raw_layer: dict, idx: int) -> dict:
+    if not isinstance(raw_layer, dict):
+        raise ValueError(f"Layer {idx} must be an object")
+
+    name = raw_layer.get("name", "")
+    if not isinstance(name, str):
+        raise ValueError(f"layers[{idx}].name must be a string")
+    name = name.strip()
+    if not name:
+        raise ValueError(f"layers[{idx}].name must not be empty")
+    if len(name) > 40:
+        raise ValueError(f"layers[{idx}].name must be at most 40 characters")
+
+    enabled = _parse_layer_bool(raw_layer.get("enabled"), f"layers[{idx}].enabled")
+    lot = _parse_layer_float(raw_layer.get("lot"), f"layers[{idx}].lot", min_value=0)
+    if lot <= 0:
+        raise ValueError(f"layers[{idx}].lot must be > 0")
+
+    tp_enabled = _parse_layer_bool(raw_layer.get("tp_enabled"), f"layers[{idx}].tp_enabled")
+    tp_pips = _parse_layer_int(raw_layer.get("tp_pips"), f"layers[{idx}].tp_pips", min_value=0)
+    if tp_enabled and tp_pips <= 0:
+        raise ValueError(f"layers[{idx}].tp_pips must be > 0 when tp_enabled is true")
+
+    be_enabled = _parse_layer_bool(raw_layer.get("be_enabled"), f"layers[{idx}].be_enabled")
+    be_trigger_pips = _parse_layer_int(
+        raw_layer.get("be_trigger_pips"), f"layers[{idx}].be_trigger_pips", min_value=0
+    )
+    be_offset_pips = _parse_layer_int(
+        raw_layer.get("be_offset_pips"), f"layers[{idx}].be_offset_pips", min_value=0
+    )
+
+    comment = raw_layer.get("comment", "")
+    if not isinstance(comment, str):
+        raise ValueError(f"layers[{idx}].comment must be a string")
+    comment = comment.strip()
+    if not comment:
+        raise ValueError(f"layers[{idx}].comment must not be empty")
+    if len(comment) > 40:
+        raise ValueError(f"layers[{idx}].comment must be at most 40 characters")
+
+    # comment is plain metadata only; do not use it for runtime matching yet.
+    return {
+        "name": name,
+        "enabled": enabled,
+        "lot": lot,
+        "tp_enabled": tp_enabled,
+        "tp_pips": tp_pips,
+        "be_enabled": be_enabled,
+        "be_trigger_pips": be_trigger_pips,
+        "be_offset_pips": be_offset_pips,
+        "comment": comment,
+    }
+
+
+def _validate_layers_config(raw_layers) -> list[dict]:
+    if raw_layers is None:
+        return []
+    if not isinstance(raw_layers, list):
+        raise ValueError("layers must be a list")
+    if len(raw_layers) > MAX_LAYERS:
+        raise ValueError(f"layers must not contain more than {MAX_LAYERS} items")
+
+    validated_layers = []
+    for idx, item in enumerate(raw_layers, start=1):
+        validated_layers.append(_validate_layer_item(item, idx))
+    return validated_layers
+
+
 def _render_root_page(*, cfg: dict, layers_html: str = "", error: str = "", saved: bool = False) -> str:
     warning_html = (
         '<div style="padding:10px;background:#fff3cd;border:1px solid #ffeeba;margin:12px 0;">'
