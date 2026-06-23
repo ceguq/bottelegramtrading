@@ -189,6 +189,8 @@ def _write_bot_config_with_backup(new_config: dict) -> None:
 
     merged = dict(prev_dict)
     merged.update(_safe_extract_allowed_keys(new_config))
+    if "layers" in new_config:
+        merged["layers"] = new_config["layers"]
 
     backup_path.write_text(
         json.dumps(prev_dict, indent=2) + "\n",
@@ -1449,6 +1451,10 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
 
         try:
             validated = _validate_and_build_settings_from_input(input_obj)
+            raw_layers = _extract_layers_from_form_qs(parsed)
+            if raw_layers is not None:
+                validated_layers = _validate_layers_config(raw_layers)
+                validated["layers"] = validated_layers
             _write_bot_config_with_backup(validated)
             self.send_response(302)
             self.send_header("Location", "/?saved=1")
