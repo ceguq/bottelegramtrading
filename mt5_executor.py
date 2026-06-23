@@ -134,7 +134,7 @@ def connect():
 
         if "metaquotes" in str(getattr(terminal, "company", "")).lower():
             logger.warning(
-                "Connected to MetaQuotes terminal; expected Valetax terminal. company=%s path=%s",
+                "Using generic MetaQuotes MT5 terminal. Account server validation will decide safety. company=%s path=%s",
                 getattr(terminal, "company", ""),
                 getattr(terminal, "path", ""),
             )
