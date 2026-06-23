@@ -222,61 +222,84 @@ def _layer_value_to_string(value) -> str:
     return str(value)
 
 
-def _render_mock_layer_card() -> str:
+def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0) -> str:
+    """Render an editable Layer form card (not yet saved to config).
+
+    Uses hidden field pattern for checkboxes to ensure form submission always includes
+    boolean values (unchecked checkboxes submit the hidden field value).
+    
+    Args:
+        layer_data: dict with layer fields, or None for defaults
+        idx: layer index (default 0 for Layer 1)
+    
+    Returns:
+        HTML string for editable layer card
+    """
+    if layer_data is None:
+        layer_data = {}
+
+    def get_field(key: str, default: str = "") -> str:
+        val = layer_data.get(key, default)
+        if isinstance(val, bool):
+            return "true" if val else "false"
+        if val is None:
+            return default
+        return str(val).strip()
+
+    enabled_val = get_field("enabled", "true")
+    name_val = get_field("name", "L1")
+    lot_val = get_field("lot", "")
+    tp_enabled_val = get_field("tp_enabled", "true")
+    tp_pips_val = get_field("tp_pips", "")
+    be_enabled_val = get_field("be_enabled", "false")
+    be_trigger_pips_val = get_field("be_trigger_pips", "50")
+    be_offset_pips_val = get_field("be_offset_pips", "0")
+    comment_val = get_field("comment", "TG-L1")
+
+    # Helper to render checkbox with hidden field for form submission
+    def checkbox_row(label: str, field_name: str, is_checked: bool) -> str:
+        checked_str = "checked" if is_checked else ""
+        return (
+            '<div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;">'
+            f'<input type="hidden" name="layers[{idx}][{field_name}]" value="false" />'
+            f'<input type="checkbox" name="layers[{idx}][{field_name}]" value="true" {checked_str} />'
+            f'<span>{_html_escape(label)}</span>'
+            '</div>'
+        )
+
+    def text_row(label: str, field_name: str, value: str, placeholder: str = "") -> str:
+        placeholder_str = f' placeholder="{_html_escape(placeholder)}"' if placeholder else ""
+        return (
+            '<div style="margin-bottom:12px;">'
+            f'<div style="margin-bottom:6px;font-weight:700;">{_html_escape(label)}</div>'
+            f'<input type="text" name="layers[{idx}][{field_name}]" value="{_html_escape(value)}"{placeholder_str} />'
+            '</div>'
+        )
+
     return (
-        '<div style="margin-top:10px;padding:10px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">'
-        '<div style="font-weight:800;margin-bottom:6px;">Layer Settings - Layer 1 (Mock, disabled)</div>'
-
-        '<div style="margin-top:8px;color:#333;line-height:1.6;">'
-        '<div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">'
-        '<input type="checkbox" disabled checked /> <span>enabled</span>'
-        '<span style="color:#666;">&nbsp;</span>'
-        '</div>'
-
-        '<div style="margin-bottom:6px;">name</div>'
-        '<div style="margin-bottom:10px;">'
-        '<input type="text" disabled value="L1" />'
-        '</div>'
-
-        '<div style="margin-bottom:6px;">lot</div>'
-        '<div style="margin-bottom:10px;">'
-        '<input type="text" disabled value="" placeholder="@@LOT@@" />'
-        '</div>'
-
-        '<div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">'
-        '<input type="checkbox" disabled checked /> <span>tp_enabled</span>'
-        '</div>'
-
-        '<div style="margin-bottom:6px;">tp_pips</div>'
-        '<div style="margin-bottom:10px;">'
-        '<input type="text" disabled value="" placeholder="@@TP1_PIPS@@" />'
-        '</div>'
-
-        '<div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">'
-        '<input type="checkbox" disabled /> <span>be_enabled</span>'
-        '</div>'
-
-        '<div style="margin-bottom:6px;">be_trigger_pips</div>'
-        '<div style="margin-bottom:10px;">'
-        '<input type="text" disabled value="50" />'
-        '</div>'
-
-        '<div style="margin-bottom:6px;">be_offset_pips</div>'
-        '<div style="margin-bottom:10px;">'
-        '<input type="text" disabled value="0" />'
-        '</div>'
-
-        '<div style="margin-bottom:6px;">comment</div>'
-        '<div style="margin-bottom:10px;">'
-        '<input type="text" disabled value="TG-L1" />'
-        '</div>'
-
-        '<div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">'
-        'Input ini masih disabled. Penyimpanan layer akan dibuat pada phase berikutnya.'
+        '<div style="margin-top:10px;padding:12px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">'
+        f'<div style="font-weight:800;margin-bottom:12px;">Layer Settings - Layer {_html_escape(str(idx + 1))}</div>'
+        '<div style="margin-top:8px;color:#333;line-height:1.8;">'
+        + checkbox_row("enabled", "enabled", enabled_val == "true")
+        + text_row("name", "name", name_val)
+        + text_row("lot", "lot", lot_val, "e.g., 0.01")
+        + checkbox_row("tp_enabled", "tp_enabled", tp_enabled_val == "true")
+        + text_row("tp_pips", "tp_pips", tp_pips_val, "e.g., 50")
+        + checkbox_row("be_enabled", "be_enabled", be_enabled_val == "true")
+        + text_row("be_trigger_pips", "be_trigger_pips", be_trigger_pips_val)
+        + text_row("be_offset_pips", "be_offset_pips", be_offset_pips_val)
+        + text_row("comment", "comment", comment_val)
+        + '<div style="margin-top:12px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">'
+        'Input layer ini belum tersimpan. Penyimpanan layer akan dibuat pada phase berikutnya.'
         '</div>'
         '</div>'
         '</div>'
     )
+
+
+def _render_mock_layer_card() -> str:
+    """Deprecated: Use _render_editable_layer_form() instead."""
+    return _render_editable_layer_form()
 
 
 def _render_layer_card(layer: dict[str, Any], idx: int) -> str:
@@ -311,7 +334,7 @@ def _render_layer_card(layer: dict[str, Any], idx: int) -> str:
 def _render_layers_section(raw_cfg: dict) -> str:
     raw_layers = raw_cfg.get("layers")
     if not isinstance(raw_layers, list):
-        return _render_mock_layer_card()
+        return _render_editable_layer_form()
 
     cards = []
     for item in raw_layers:
@@ -322,7 +345,7 @@ def _render_layers_section(raw_cfg: dict) -> str:
             break
 
     if not cards:
-        return _render_mock_layer_card()
+        return _render_editable_layer_form()
 
     return "".join(cards)
 
