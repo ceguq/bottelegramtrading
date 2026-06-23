@@ -372,22 +372,25 @@ def _default_layer_form_data(raw_cfg: dict) -> dict:
 
 
 def _render_layers_section(raw_cfg: dict) -> str:
+    """Render Layer Settings UI.
+
+    Phase 3B-8D requirement:
+    - If raw_cfg["layers"] is a valid list and contains at least one valid dict,
+      render Layer 1 using the existing editable layer form.
+    - Otherwise, render editable form using defaults.
+
+    Note:
+    - Saved layers are intentionally NOT rendered as read-only cards yet.
+    - Only visual support for a single layer (Layer 1) is enabled.
+    """
     raw_layers = raw_cfg.get("layers")
-    if not isinstance(raw_layers, list):
-        return _render_editable_layer_form(_default_layer_form_data(raw_cfg))
+    if isinstance(raw_layers, list) and raw_layers:
+        for item in raw_layers:
+            if isinstance(item, dict):
+                return _render_editable_layer_form(layer_data=item, idx=0)
 
-    cards = []
-    for item in raw_layers:
-        if not isinstance(item, dict):
-            continue
-        cards.append(_render_layer_card(item, len(cards) + 1))
-        if len(cards) >= 10:
-            break
+    return _render_editable_layer_form(_default_layer_form_data(raw_cfg))
 
-    if not cards:
-        return _render_editable_layer_form(_default_layer_form_data(raw_cfg))
-
-    return "".join(cards)
 
 
 MAX_LAYERS = 10
