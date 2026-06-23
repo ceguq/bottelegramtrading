@@ -600,7 +600,7 @@ def _validate_layers_config(raw_layers) -> list[dict]:
     return validated_layers
 
 
-def _render_root_page(*, cfg: dict, layers_html: str = "", error: str = "", saved: bool = False) -> str:
+def _render_root_page(*, cfg: dict, raw_cfg: dict | None = None, layers_html: str = "", error: str = "", saved: bool = False) -> str:
     warning_html = (
         '<div style="padding:10px;background:#fff3cd;border:1px solid #ffeeba;margin:12px 0;">'
         'Perubahan config baru aktif setelah bot direstart.'
@@ -623,8 +623,101 @@ def _render_root_page(*, cfg: dict, layers_html: str = "", error: str = "", save
             "</div>"
         )
 
-    def val(k):
-        return cfg.get(k, "")
+    # Safety Status section (read-only)
+    if raw_cfg is None:
+        raw_cfg = {}
+    
+    telegram_test_mode = raw_cfg.get("telegram_test_mode", False)
+    allow_real_order = raw_cfg.get("allow_real_order", False)
+    layers = raw_cfg.get("layers", [])
+    
+    # Determine safety status
+    if telegram_test_mode is True:
+        safety_status = "SAFE: TEST MODE - order_send disabled"
+        status_color = "#28a745"  # green
+    elif telegram_test_mode is False and allow_real_order is not True:
+        safety_status = "SAFE: REAL BLOCKED - allow_real_order is not true"
+        status_color = "#28a745"  # green
+    else:  # telegram_test_mode is False and allow_real_order is True
+        safety_status = "DANGER: REAL ORDER ENABLED"
+        status_color = "#dc3545"  # red
+    
+    # Build layer info display
+    layer_info_lines = []
+    if isinstance(layers, list) and len(layers) > 0:
+        layer1 = layers[0]
+        if isinstance(layer1, dict):
+            layer1_enabled = layer1.get("enabled", False)
+            layer1_lot = layer1.get("lot", "N/A")
+            layer_info_lines.append(f"Layer 1 enabled: <code>{_html_escape(str(layer1_enabled))}</code>")
+            layer_info_lines.append(f"Layer 1 lot: <code>{_html_escape(str(layer1_lot))}</code>")
+    
+    layer_info_html = ""
+    if layer_info_lines:
+        layer_info_html = "<br/>".join(layer_info_lines)
+    
+    safety_status_html = (
+        '<div style="padding:12px;background:#f8f9fa;border:2px solid ' + status_color + ';border-radius:10px;max-width:760px;margin:14px 0;">'
+        '<div style="font-weight:800;margin-bottom:8px;color:' + status_color + ';">'
+        f'{_html_escape(safety_status)}'
+        '</div>'
+        '<div style="color:#333;line-height:1.6;font-size:13px;">'
+        f'telegram_test_mode: <code>{_html_escape(str(telegram_test_mode))}</code><br/>'
+        f'allow_real_order: <code>{_html_escape(str(allow_real_order if allow_real_order is not False else "missing/false"))}</code>'
+    )
+    
+    if layer_info_html:
+        safety_status_html += "<br/>" + layer_info_html
+    
+    safety_status_html += "</div></div>"
+
+    # Safety Status section (read-only)
+    if raw_cfg is None:
+        raw_cfg = {}
+    
+    telegram_test_mode = raw_cfg.get("telegram_test_mode", False)
+    allow_real_order = raw_cfg.get("allow_real_order", False)
+    layers = raw_cfg.get("layers", [])
+    
+    # Determine safety status
+    if telegram_test_mode is True:
+        safety_status = "SAFE: TEST MODE - order_send disabled"
+        status_color = "#28a745"  # green
+    elif telegram_test_mode is False and allow_real_order is not True:
+        safety_status = "SAFE: REAL BLOCKED - allow_real_order is not true"
+        status_color = "#28a745"  # green
+    else:  # telegram_test_mode is False and allow_real_order is True
+        safety_status = "DANGER: REAL ORDER ENABLED"
+        status_color = "#dc3545"  # red
+    
+    # Build layer info display
+    layer_info_lines = []
+    if isinstance(layers, list) and len(layers) > 0:
+        layer1 = layers[0]
+        if isinstance(layer1, dict):
+            layer1_enabled = layer1.get("enabled", False)
+            layer1_lot = layer1.get("lot", "N/A")
+            layer_info_lines.append(f"Layer 1 enabled: <code>{_html_escape(str(layer1_enabled))}</code>")
+            layer_info_lines.append(f"Layer 1 lot: <code>{_html_escape(str(layer1_lot))}</code>")
+    
+    layer_info_html = ""
+    if layer_info_lines:
+        layer_info_html = "<br/>".join(layer_info_lines)
+    
+    safety_status_html = (
+        '<div style="padding:12px;background:#f8f9fa;border:2px solid ' + status_color + ';border-radius:10px;max-width:760px;margin:14px 0;">' 
+        '<div style="font-weight:800;margin-bottom:8px;color:' + status_color + ';">' 
+        f'{_html_escape(safety_status)}'
+        '</div>' 
+        '<div style="color:#333;line-height:1.6;font-size:13px;">' 
+        f'telegram_test_mode: <code>{_html_escape(str(telegram_test_mode))}</code><br/>'
+        f'allow_real_order: <code>{_html_escape(str(allow_real_order if allow_real_order is not False else "missing/false"))}</code>'
+    )
+    
+    if layer_info_html:
+        safety_status_html += "<br/>" + layer_info_html
+    
+    safety_status_html += "</div></div>"
 
     template_str = """<!doctype html>
 <html lang="en">
@@ -659,6 +752,7 @@ def _render_root_page(*, cfg: dict, layers_html: str = "", error: str = "", save
   @@ERR_HTML@@
   @@WARNING_HTML@@
 
+  @@SAFETY_STATUS@@
 
   <h2>Config (Safe Fields)</h2>
   <form method="POST" action="/config">
@@ -900,6 +994,7 @@ async function botRestart() {
         "@@MSG_HTML@@": msg_html,
         "@@ERR_HTML@@": err_html,
         "@@WARNING_HTML@@": warning_html,
+        "@@SAFETY_STATUS@@": safety_status_html,
         "@@BOT_PROCESS_SECTION@@": bot_process_section_html,
         "@@LAYERS_SECTION@@": layers_html,
     
@@ -1436,7 +1531,7 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
             raw_cfg = _safe_load_bot_config_json()
             cfg = _safe_extract_allowed_keys(raw_cfg)
             layers_html = _render_layers_section(raw_cfg)
-            html_page = _render_root_page(cfg=cfg, layers_html=layers_html, saved=saved)
+            html_page = _render_root_page(cfg=cfg, raw_cfg=raw_cfg, layers_html=layers_html, saved=saved)
             self._send(200, "text/html; charset=utf-8", html_page.encode("utf-8"))
         except Exception as e:
             return self._send_root_error_response(e, route=route or "/")
@@ -1466,7 +1561,7 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/?saved=1")
             self.end_headers()
         except Exception as e:
-            html = _render_root_page(cfg=prev_cfg, layers_html=layers_html, error=str(e), saved=False)
+            html = _render_root_page(cfg=prev_cfg, raw_cfg=raw_cfg, layers_html=layers_html, error=str(e), saved=False)
             self._send(200, "text/html; charset=utf-8", html.encode("utf-8"))
 
     def _handle_api_config(self):
