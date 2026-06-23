@@ -305,7 +305,8 @@ def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0) ->
         + text_row("be_offset_pips", "be_offset_pips", be_offset_pips_val)
         + text_row("comment", "comment", comment_val)
         + '<div style="margin-top:12px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">'
-        'Input layer ini belum tersimpan. Penyimpanan layer akan dibuat pada phase berikutnya.'
+        'Layer ini sudah bisa disimpan. Perubahan akan masuk ke bot_config.json setelah klik Simpan.'
+
         '</div>'
         '</div>'
         '</div>'
@@ -676,7 +677,8 @@ def _render_root_page(*, cfg: dict, layers_html: str = "", error: str = "", save
     <div style="padding:12px;background:#f8f9fa;border:1px solid #e9ecef;border-radius:10px;max-width:760px;margin:14px 0;">
       <div style="font-weight:800;margin-bottom:6px;">Layer Settings</div>
       <div style="color:#333;">
-        Fitur konfigurasi layer akan ditambahkan bertahap. Saat ini order execution masih memakai legacy logic.
+        Layer 1 sudah bisa disimpan ke bot_config.json lewat tombol Simpan. Saat ini order execution masih memakai legacy logic.
+
       </div>
 
       <div style="margin-top:10px;">
@@ -704,7 +706,8 @@ def _render_root_page(*, cfg: dict, layers_html: str = "", error: str = "", save
       </div>
 
       <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">
-        Layer config belum dipakai untuk order sampai phase berikutnya.
+        Catatan: Layer config sudah tersimpan, tetapi belum dipakai untuk eksekusi order sampai phase berikutnya.
+
       </div>
     </div>
 
