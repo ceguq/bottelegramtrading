@@ -255,10 +255,40 @@ def check_orders(
     entry_second: float,
     sl_raw: float,
     lot_override: float | None = None,
+    lot_overrides: list[float | None] | None = None,
+    order_enabled: list[bool] | None = None,
 ) -> dict:
-    effective_lot = LOT if lot_override is None else float(lot_override)
-    if not (effective_lot > 0):
-        raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
+    # Resolve effective lots with backward compatibility
+    if lot_overrides is not None:
+        # Per-order lots from layer mapping
+        if not isinstance(lot_overrides, list) or len(lot_overrides) != 3:
+            raise ValueError(f"lot_overrides must be a list of 3 items; got: {lot_overrides}")
+        effective_lots = [LOT if x is None else float(x) for x in lot_overrides]
+    elif lot_override is not None:
+        # Legacy scalar lot_override: apply to all 3 orders
+        effective_lot = float(lot_override)
+        if not (effective_lot > 0):
+            raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
+        effective_lots = [effective_lot, effective_lot, effective_lot]
+    else:
+        # No override: use default LOT for all 3 orders
+        effective_lots = [LOT, LOT, LOT]
+    
+    # Validate all lots > 0
+    for i, lot in enumerate(effective_lots):
+        if not (lot > 0):
+            raise ValueError(f"effective_lots[{i}] must be > 0; got: {lot}")
+    
+    # Resolve order enabled status
+    if order_enabled is not None:
+        if not isinstance(order_enabled, list) or len(order_enabled) != 3:
+            raise ValueError(f"order_enabled must be a list of 3 items; got: {order_enabled}")
+        enabled_list = order_enabled
+    else:
+        # Default: all orders enabled
+        enabled_list = [True, True, True]
+    
+    effective_lot = effective_lots[0]  # For result_data backward compat
 
 
     result_data = {
@@ -439,11 +469,28 @@ def check_orders(
             (TP3_COMMENT, entry_third_norm, None, order_type_tp3),
         )
 
-        for comment, price_level, tp_level, pending_type in orders:
+        for order_idx, (comment, price_level, tp_level, pending_type) in enumerate(orders):
+            # Skip disabled orders
+            if not enabled_list[order_idx]:
+                # Log skipped order
+                skipped_record = {
+                    "comment": comment,
+                    "ok": True,
+                    "checked": False,
+                    "skipped": True,
+                    "reason": "order disabled by layer config",
+                    "request": None,
+                    "retcode": None,
+                    "comment_result": None,
+                    "error": "Skipped by layer config",
+                }
+                result_data["orders"].append(skipped_record)
+                continue
+            
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": SYMBOL,
-                "volume": effective_lot,
+                "volume": effective_lots[order_idx],
                 "type": pending_type,
                 "price": price_level,
                 "sl": sl_actual,
@@ -1203,16 +1250,49 @@ def update_sl_for_order_group(order_group: dict, new_sl: float) -> dict:
 
 
 @_with_mt5_lock
-def place_orders(direction, entry_first, entry_second, sl_raw, lot_override: float | None = None):
+def place_orders(
+    direction,
+    entry_first,
+    entry_second,
+    sl_raw,
+    lot_override: float | None = None,
+    lot_overrides: list[float | None] | None = None,
+    order_enabled: list[bool] | None = None,
+):
     """
     Place three pending orders: two TP layers and one no-TP layer.
 
-
     Returns successful ticket numbers in order: [ticket_tp1, ticket_tp2, ticket_tp3].
     """
-    effective_lot = LOT if lot_override is None else float(lot_override)
-    if not (effective_lot > 0):
-        raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
+    # Resolve effective lots with backward compatibility
+    if lot_overrides is not None:
+        # Per-order lots from layer mapping
+        if not isinstance(lot_overrides, list) or len(lot_overrides) != 3:
+            raise ValueError(f"lot_overrides must be a list of 3 items; got: {lot_overrides}")
+        effective_lots = [LOT if x is None else float(x) for x in lot_overrides]
+    elif lot_override is not None:
+        # Legacy scalar lot_override: apply to all 3 orders
+        effective_lot = float(lot_override)
+        if not (effective_lot > 0):
+            raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
+        effective_lots = [effective_lot, effective_lot, effective_lot]
+    else:
+        # No override: use default LOT for all 3 orders
+        effective_lots = [LOT, LOT, LOT]
+    
+    # Validate all lots > 0
+    for i, lot in enumerate(effective_lots):
+        if not (lot > 0):
+            raise ValueError(f"effective_lots[{i}] must be > 0; got: {lot}")
+    
+    # Resolve order enabled status
+    if order_enabled is not None:
+        if not isinstance(order_enabled, list) or len(order_enabled) != 3:
+            raise ValueError(f"order_enabled must be a list of 3 items; got: {order_enabled}")
+        enabled_list = order_enabled
+    else:
+        # Default: all orders enabled
+        enabled_list = [True, True, True]
 
     tickets = []
 
@@ -1250,11 +1330,16 @@ def place_orders(direction, entry_first, entry_second, sl_raw, lot_override: flo
             (TP3_COMMENT, entry_third, None, order_type_tp3),
         )
 
-        for comment, order_entry, tp, order_type in orders:
+        for order_idx, (comment, order_entry, tp, order_type) in enumerate(orders):
+            # Skip disabled orders
+            if not enabled_list[order_idx]:
+                logger.info("Skipping %s (layer disabled)", comment)
+                continue
+            
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": SYMBOL,
-                "volume": effective_lot,
+                "volume": effective_lots[order_idx],
                 "type": order_type,
                 "price": order_entry,
                 "sl": sl_actual,
@@ -1279,7 +1364,7 @@ def place_orders(direction, entry_first, entry_second, sl_raw, lot_override: flo
                     sl_actual,
                     tp,
                     order_type,
-                    effective_lot,
+                    effective_lots[order_idx],
                 )
                 continue
 

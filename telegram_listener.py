@@ -495,42 +495,59 @@ async def handle_signal(event):
     print("TP2 target:", signal["tp2_target"])
     print("Layer 3 / TG-NO-TP: NO TP")
 
-    # Load runtime layers to determine lot_override
-    lot_override = None
+    # Load runtime layers to determine per-order lot_overrides and order_enabled
+    lot_overrides = None
+    order_enabled = None
     try:
         layers = load_runtime_layers()
         if layers is None:
-            # No layer config: use legacy behavior
-            logger.info("Layer config missing; using legacy lot")
-            print("Layer config missing; using legacy lot")
-            lot_override = None
+            # No layer config: use legacy behavior (all None, all enabled)
+            logger.info("Layer config missing; using legacy lot for all 3 orders")
+            print("Layer config missing; using legacy lot for all 3 orders")
+            lot_overrides = None
+            order_enabled = None
         elif len(layers) == 0:
             # Empty layer list: skip signal (fail-safe)
             logger.info("Layer config exists but has no layers; skipping signal")
             print("Layer config exists but has no layers; skipping signal")
             return
         else:
-            # Non-empty list: use first layer
-            layer = layers[0]
-            if not layer.get("enabled", False):
-                # Layer disabled: skip signal
-                logger.info("Layer 1 disabled; skipping signal")
-                print("Layer 1 disabled; skipping signal")
-                return
-            else:
-                # Layer enabled: use layer lot
-                layer_lot = layer.get("lot")
-                lot_override = layer_lot
-                logger.info("Layer 1 active; using layer lot=%s", layer_lot)
-                print(f"Layer 1 active; using layer lot={layer_lot}")
-                
-                # Log ignored fields for this phase
-                if not layer.get("tp_enabled", True):
-                    logger.info("Layer 1 tp_enabled=false ignored in this phase; legacy TP ladder still active")
-                    print("Layer 1 tp_enabled=false ignored in this phase; legacy TP ladder still active")
-                
-                logger.info("Layer 1 comment and BE fields ignored in this phase")
-                print("Layer 1 comment and BE fields ignored in this phase")
+            # Non-empty list: map layers[0:3] to orders[0:3]
+            lot_overrides = [None, None, None]
+            order_enabled = [True, True, True]
+            mapping_parts = []
+            
+            for order_idx in range(3):
+                layer_num = order_idx + 1  # Layer 1, Layer 2, Layer 3
+                if len(layers) > order_idx:
+                    layer = layers[order_idx]
+                    layer_enabled = layer.get("enabled", False)
+                    layer_lot = layer.get("lot")
+                    layer_name = layer.get("name", f"L{layer_num}")
+                    
+                    if layer_enabled:
+                        # Layer enabled: use its lot
+                        lot_overrides[order_idx] = layer_lot
+                        order_enabled[order_idx] = True
+                        mapping_parts.append(f"{layer_name}=enabled lot={layer_lot}")
+                    else:
+                        # Layer disabled: skip this order only
+                        order_enabled[order_idx] = False
+                        lot_overrides[order_idx] = None
+                        mapping_parts.append(f"{layer_name}=disabled skipped")
+                else:
+                    # Layer missing: use default lot, enable order
+                    lot_overrides[order_idx] = None
+                    order_enabled[order_idx] = True
+                    mapping_parts.append(f"L{layer_num}=missing default")
+            
+            mapping_str = ", ".join(mapping_parts)
+            logger.info("Layer mapping: %s", mapping_str)
+            print(f"Layer mapping: {mapping_str}")
+            
+            # Log ignored fields for this phase
+            logger.info("Layer TP/BE/comment fields ignored in this phase; legacy TP ladder and BE still active")
+            print("Layer TP/BE/comment fields ignored in this phase; legacy TP ladder and BE still active")
     except Exception as exc:
         # Exception loading layers: skip signal (fail-safe)
         logger.error("Exception loading runtime layers: %s; skipping signal", exc)
@@ -557,7 +574,9 @@ async def handle_signal(event):
                 signal["entry_first"],
                 signal["entry_second"],
                 signal["sl"],
-                lot_override,
+                None,  # lot_override (legacy)
+                lot_overrides,  # per-order lots
+                order_enabled,  # per-order enabled
             )
         except Exception:
             logger.exception("check_orders failed")
@@ -642,7 +661,9 @@ async def handle_signal(event):
             signal["entry_first"],
             signal["entry_second"],
             sl,
-            lot_override,
+            None,  # lot_override (legacy)
+            lot_overrides,  # per-order lots
+            order_enabled,  # per-order enabled
         )
     except Exception:
         logger.exception("Gagal mengirim order ke MT5.")
