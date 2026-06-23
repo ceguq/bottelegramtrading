@@ -224,7 +224,7 @@ def _layer_value_to_string(value) -> str:
     return str(value)
 
 
-def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0) -> str:
+def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0, order_name: str = "") -> str:
     """Render an editable Layer form card (not yet saved to config).
 
     Uses hidden field pattern for checkboxes to ensure form submission always includes
@@ -233,6 +233,7 @@ def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0) ->
     Args:
         layer_data: dict with layer fields, or None for defaults
         idx: layer index (default 0 for Layer 1)
+        order_name: human-readable order name like "TG-TP1", "TG-TP2", "TG-NO-TP"
     
     Returns:
         HTML string for editable layer card
@@ -291,9 +292,12 @@ def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0) ->
             '</div>'
         )
 
+    # Determine layer title with order name
+    layer_title = f"Layer {idx + 1} / {order_name}" if order_name else f"Layer {idx + 1}"
+
     return (
         '<div style="margin-top:10px;padding:12px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">'
-        f'<div style="font-weight:800;margin-bottom:12px;">Layer Settings - Layer {_html_escape(str(idx + 1))}</div>'
+        f'<div style="font-weight:800;margin-bottom:12px;">{_html_escape(layer_title)}</div>'
         '<div style="margin-top:8px;color:#333;line-height:1.8;">'
         + checkbox_row("enabled", "enabled", is_checkbox_checked(enabled_val))
         + text_row("name", "name", name_val)
@@ -347,50 +351,109 @@ def _render_layer_card(layer: dict[str, Any], idx: int) -> str:
     )
 
 
-def _default_layer_form_data(raw_cfg: dict) -> dict:
-    """Build default layer data for editable Layer 1 form from legacy config.
+def _get_default_layer_for_index(raw_cfg: dict, idx: int) -> dict:
+    """Build default layer data for the specified index (0-2 for Layer 1-3).
     
-    Derives layer defaults from legacy config fields to avoid validation failures
-    when layer save is wired into POST /config.
+    Derives layer defaults from legacy config fields to avoid validation failures.
+    Each layer has a specific purpose:
+    - Layer 0 (TG-TP1): First TP ladder
+    - Layer 1 (TG-TP2): Second TP ladder  
+    - Layer 2 (TG-NO-TP): No TP order
     
     Args:
         raw_cfg: raw bot_config.json dict
+        idx: layer index (0, 1, or 2)
         
     Returns:
-        dict with layer form defaults, using legacy config values where applicable
+        dict with layer form defaults
     """
-    return {
-        "enabled": True,
-        "name": "L1",
-        "lot": raw_cfg.get("lot", ""),
-        "tp_enabled": True,
-        "tp_pips": raw_cfg.get("tp1_pips", ""),
-        "be_enabled": False,
-        "be_trigger_pips": 50,
-        "be_offset_pips": 0,
-        "comment": "TG-L1",
-    }
+    legacy_lot = raw_cfg.get("lot", 0.01)
+    
+    if idx == 0:
+        # Layer 1 / TG-TP1
+        return {
+            "enabled": True,
+            "name": "L1",
+            "lot": legacy_lot,
+            "tp_enabled": True,
+            "tp_pips": raw_cfg.get("tp1_pips", 50),
+            "be_enabled": False,
+            "be_trigger_pips": 50,
+            "be_offset_pips": 0,
+            "comment": "TG-TP1",
+        }
+    elif idx == 1:
+        # Layer 2 / TG-TP2
+        return {
+            "enabled": True,
+            "name": "L2",
+            "lot": legacy_lot,
+            "tp_enabled": True,
+            "tp_pips": raw_cfg.get("tp2_pips", 100),
+            "be_enabled": False,
+            "be_trigger_pips": 50,
+            "be_offset_pips": 0,
+            "comment": "TG-TP2",
+        }
+    else:  # idx == 2
+        # Layer 3 / TG-NO-TP
+        return {
+            "enabled": True,
+            "name": "L3",
+            "lot": legacy_lot,
+            "tp_enabled": False,
+            "tp_pips": 0,
+            "be_enabled": False,
+            "be_trigger_pips": 50,
+            "be_offset_pips": 0,
+            "comment": "TG-NO-TP",
+        }
 
 
 def _render_layers_section(raw_cfg: dict) -> str:
-    """Render Layer Settings UI.
+    """Render Layer Settings UI for exactly 3 fixed layers.
 
-    Phase 3B-8D requirement:
-    - If raw_cfg["layers"] is a valid list and contains at least one valid dict,
-      render Layer 1 using the existing editable layer form.
-    - Otherwise, render editable form using defaults.
+    Phase 3D-3 requirement:
+    - Always render exactly 3 editable layer forms (Layer 1, 2, 3)
+    - If bot_config.json has fewer than 3 layers, fill with safe defaults
+    - Each layer maps to an order: L1->TG-TP1, L2->TG-TP2, L3->TG-NO-TP
 
     Note:
-    - Saved layers are intentionally NOT rendered as read-only cards yet.
-    - Only visual support for a single layer (Layer 1) is enabled.
+    - Runtime currently uses only enabled + lot per layer
+    - TP/BE/comment fields are saved but not active yet
     """
-    raw_layers = raw_cfg.get("layers")
-    if isinstance(raw_layers, list) and raw_layers:
-        for item in raw_layers:
-            if isinstance(item, dict):
-                return _render_editable_layer_form(layer_data=item, idx=0)
-
-    return _render_editable_layer_form(_default_layer_form_data(raw_cfg))
+    order_names = ["TG-TP1", "TG-TP2", "TG-NO-TP"]
+    raw_layers = raw_cfg.get("layers", [])
+    
+    # Ensure raw_layers is a list
+    if not isinstance(raw_layers, list):
+        raw_layers = []
+    
+    # Build all 3 layer forms
+    layers_html = ""
+    for idx in range(3):
+        # Use existing layer if available, otherwise use defaults
+        if idx < len(raw_layers) and isinstance(raw_layers[idx], dict):
+            layer_data = raw_layers[idx]
+        else:
+            layer_data = _get_default_layer_for_index(raw_cfg, idx)
+        
+        layers_html += _render_editable_layer_form(
+            layer_data=layer_data,
+            idx=idx,
+            order_name=order_names[idx]
+        )
+    
+    # Add info note about what's currently active
+    note = (
+        '<div style="margin-top:16px;padding:12px;border-radius:8px;background:#e7f3ff;border:1px solid #b3d9ff;color:#004085;font-size:14px;line-height:1.6;">'
+        '<strong>ℹ️ Runtime Status:</strong><br/>'
+        'Runtime currently uses <strong>enabled</strong> and <strong>lot</strong> per layer.<br/>'
+        'TP/BE/comment fields are saved but not active yet.'
+        '</div>'
+    )
+    
+    return layers_html + note
 
 
 
