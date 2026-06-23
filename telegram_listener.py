@@ -13,6 +13,20 @@ separate process.
 import asyncio
 import logging
 import re
+import sys
+from pathlib import Path
+
+# Safety guard (defense-in-depth): refuse to run unless started with the project venv Python.
+expected_venv_python = (Path(__file__).resolve().parent / ".venv" / "Scripts" / "python.exe").resolve()
+current_python = Path(sys.executable).resolve()
+if current_python != expected_venv_python:
+    print(
+        "telegram_listener.py must be started with the project venv Python.\n"
+        "Use: .\\.venv\\Scripts\\python.exe .\\run_bot.py",
+        flush=True,
+    )
+    raise SystemExit(1)
+
 
 from telethon import TelegramClient, events
 

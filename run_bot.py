@@ -246,9 +246,24 @@ def _stop_all(processes: list[subprocess.Popen]) -> None:
 
 
 def main() -> int:
+    # Safety guard: ensure this runner is started with the project venv Python.
+    # This prevents spawning child processes with a different (global) interpreter,
+    # which can lead to duplicate bot stacks.
+    expected_venv_python = (BASE_DIR / ".venv" / "Scripts" / "python.exe").resolve()
+    current_python = Path(sys.executable).resolve()
+
+    if current_python != expected_venv_python:
+        print(
+            "This bot must be started with the project venv Python.\n"
+            "Use: .\\.venv\\Scripts\\python.exe .\\run_bot.py",
+            flush=True,
+        )
+        return 1
+
     if _other_project_run_bot_processes():
         print(STACK_RUNNING_MESSAGE, flush=True)
         return 1
+
 
     with _SingleInstanceGuard(STACK_LOCK_PATH) as lock_acquired:
         if not lock_acquired:
