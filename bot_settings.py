@@ -251,6 +251,53 @@ def load_runtime_layers(path: str | Path | None = None) -> list[dict[str, Any]] 
     return validated
 
 
+def load_allow_real_order(path: str | Path | None = None) -> bool:
+    """Load optional allow_real_order flag from bot_config.json.
+
+    Returns:
+        - False: if 'allow_real_order' key is missing (safe default)
+        - bool: the value of 'allow_real_order' if present and is bool
+
+    Raises:
+        - ValueError: if 'allow_real_order' exists but is not bool
+        - FileNotFoundError: if bot_config.json not found
+        - ValueError: if bot_config.json is invalid JSON
+
+    Notes:
+        - Separate from load_settings() to maintain backward compatibility
+        - Missing key = safe default (False), not error
+        - Follows load_runtime_layers() pattern
+    """
+    base_dir = Path(__file__).resolve().parent
+    config_path = Path(path) if path is not None else (base_dir / _DEFAULT_FILENAME)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"bot_config.json not found at: {config_path}")
+
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in config file {config_path}: {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Config root must be a JSON object; got: {type(data).__name__}")
+
+    # If key is missing, return safe default False
+    if "allow_real_order" not in data:
+        return False
+
+    value = data["allow_real_order"]
+
+    # Validate type: must be bool
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"Config key 'allow_real_order' must be boolean; got: {type(value).__name__}"
+        )
+
+    return value
+
+
 
 
 

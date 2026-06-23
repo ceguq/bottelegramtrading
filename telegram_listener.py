@@ -39,7 +39,7 @@ from mt5_executor import (
     update_sl_for_order_group,
 )
 
-from bot_settings import load_settings, load_runtime_layers
+from bot_settings import load_settings, load_runtime_layers, load_allow_real_order
 
 
 logging.basicConfig(
@@ -607,7 +607,19 @@ async def handle_signal(event):
 
         return
 
-    # Real execution path
+    # Real execution path: check if allow_real_order is true before proceeding
+    try:
+        allow_real_order = load_allow_real_order()
+    except Exception as exc:
+        logger.error("Exception loading allow_real_order flag: %s; skipping signal", exc)
+        print(f"Exception loading allow_real_order flag: {exc}; skipping signal")
+        return
+
+    if not allow_real_order:
+        logger.warning("REAL mode blocked: allow_real_order is not true in bot_config.json; skipping signal")
+        print("REAL mode blocked: allow_real_order is not true; signal skipped")
+        return
+
     direction = signal["direction"]
     sl = signal["sl"]
 
