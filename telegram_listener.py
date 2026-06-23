@@ -39,7 +39,7 @@ from mt5_executor import (
     update_sl_for_order_group,
 )
 
-from bot_settings import load_settings
+from bot_settings import load_settings, load_runtime_layers
 
 
 logging.basicConfig(
@@ -495,6 +495,48 @@ async def handle_signal(event):
     print("TP2 target:", signal["tp2_target"])
     print("Layer 3 / TG-NO-TP: NO TP")
 
+    # Load runtime layers to determine lot_override
+    lot_override = None
+    try:
+        layers = load_runtime_layers()
+        if layers is None:
+            # No layer config: use legacy behavior
+            logger.info("Layer config missing; using legacy lot")
+            print("Layer config missing; using legacy lot")
+            lot_override = None
+        elif len(layers) == 0:
+            # Empty layer list: skip signal (fail-safe)
+            logger.info("Layer config exists but has no layers; skipping signal")
+            print("Layer config exists but has no layers; skipping signal")
+            return
+        else:
+            # Non-empty list: use first layer
+            layer = layers[0]
+            if not layer.get("enabled", False):
+                # Layer disabled: skip signal
+                logger.info("Layer 1 disabled; skipping signal")
+                print("Layer 1 disabled; skipping signal")
+                return
+            else:
+                # Layer enabled: use layer lot
+                layer_lot = layer.get("lot")
+                lot_override = layer_lot
+                logger.info("Layer 1 active; using layer lot=%s", layer_lot)
+                print(f"Layer 1 active; using layer lot={layer_lot}")
+                
+                # Log ignored fields for this phase
+                if not layer.get("tp_enabled", True):
+                    logger.info("Layer 1 tp_enabled=false ignored in this phase; legacy TP ladder still active")
+                    print("Layer 1 tp_enabled=false ignored in this phase; legacy TP ladder still active")
+                
+                logger.info("Layer 1 comment and BE fields ignored in this phase")
+                print("Layer 1 comment and BE fields ignored in this phase")
+    except Exception as exc:
+        # Exception loading layers: skip signal (fail-safe)
+        logger.error("Exception loading runtime layers: %s; skipping signal", exc)
+        print(f"Exception loading runtime layers: {exc}; skipping signal")
+        return
+
     # TEST MODE path
     if TELEGRAM_TEST_MODE is True:
         # Reference: MT5 symbol is fixed in mt5_executor.py; do not redefine it here.
@@ -515,6 +557,7 @@ async def handle_signal(event):
                 signal["entry_first"],
                 signal["entry_second"],
                 signal["sl"],
+                lot_override,
             )
         except Exception:
             logger.exception("check_orders failed")
@@ -587,6 +630,7 @@ async def handle_signal(event):
             signal["entry_first"],
             signal["entry_second"],
             sl,
+            lot_override,
         )
     except Exception:
         logger.exception("Gagal mengirim order ke MT5.")
