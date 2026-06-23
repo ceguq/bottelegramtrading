@@ -2,6 +2,7 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import html
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 import os
 import subprocess
@@ -213,8 +214,120 @@ def _html_escape(s) -> str:
     return html.escape(str(s), quote=True)
 
 
+def _layer_value_to_string(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    return str(value)
 
-def _render_root_page(*, cfg: dict, error: str = "", saved: bool = False) -> str:
+
+def _render_mock_layer_card() -> str:
+    return (
+        '<div style="margin-top:10px;padding:10px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">'
+        '<div style="font-weight:800;margin-bottom:6px;">Layer Settings - Layer 1 (Mock, disabled)</div>'
+
+        '<div style="margin-top:8px;color:#333;line-height:1.6;">'
+        '<div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">'
+        '<input type="checkbox" disabled checked /> <span>enabled</span>'
+        '<span style="color:#666;">&nbsp;</span>'
+        '</div>'
+
+        '<div style="margin-bottom:6px;">name</div>'
+        '<div style="margin-bottom:10px;">'
+        '<input type="text" disabled value="L1" />'
+        '</div>'
+
+        '<div style="margin-bottom:6px;">lot</div>'
+        '<div style="margin-bottom:10px;">'
+        '<input type="text" disabled value="" placeholder="@@LOT@@" />'
+        '</div>'
+
+        '<div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">'
+        '<input type="checkbox" disabled checked /> <span>tp_enabled</span>'
+        '</div>'
+
+        '<div style="margin-bottom:6px;">tp_pips</div>'
+        '<div style="margin-bottom:10px;">'
+        '<input type="text" disabled value="" placeholder="@@TP1_PIPS@@" />'
+        '</div>'
+
+        '<div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">'
+        '<input type="checkbox" disabled /> <span>be_enabled</span>'
+        '</div>'
+
+        '<div style="margin-bottom:6px;">be_trigger_pips</div>'
+        '<div style="margin-bottom:10px;">'
+        '<input type="text" disabled value="50" />'
+        '</div>'
+
+        '<div style="margin-bottom:6px;">be_offset_pips</div>'
+        '<div style="margin-bottom:10px;">'
+        '<input type="text" disabled value="0" />'
+        '</div>'
+
+        '<div style="margin-bottom:6px;">comment</div>'
+        '<div style="margin-bottom:10px;">'
+        '<input type="text" disabled value="TG-L1" />'
+        '</div>'
+
+        '<div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">'
+        'Input ini masih disabled. Penyimpanan layer akan dibuat pada phase berikutnya.'
+        '</div>'
+        '</div>'
+        '</div>'
+    )
+
+
+def _render_layer_card(layer: dict[str, Any], idx: int) -> str:
+    def row(label: str, value: Any) -> str:
+        return (
+            '<div style="margin-bottom:6px;font-weight:700;">'
+            f'{_html_escape(label)}'
+            '</div>'
+            '<div style="margin-bottom:12px;color:#333;">'
+            f'{_html_escape(_layer_value_to_string(value))}'
+            '</div>'
+        )
+
+    return (
+        '<div style="margin-top:10px;padding:12px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">'
+        f'<div style="font-weight:800;margin-bottom:6px;">Layer Settings - Layer {_html_escape(str(idx))}</div>'
+        '<div style="margin-top:8px;color:#333;line-height:1.6;">'
+        + row("name", layer.get("name", ""))
+        + row("enabled", layer.get("enabled", ""))
+        + row("lot", layer.get("lot", ""))
+        + row("tp_enabled", layer.get("tp_enabled", ""))
+        + row("tp_pips", layer.get("tp_pips", ""))
+        + row("be_enabled", layer.get("be_enabled", ""))
+        + row("be_trigger_pips", layer.get("be_trigger_pips", ""))
+        + row("be_offset_pips", layer.get("be_offset_pips", ""))
+        + row("comment", layer.get("comment", ""))
+        + '</div>'
+        + '</div>'
+    )
+
+
+def _render_layers_section(raw_cfg: dict) -> str:
+    raw_layers = raw_cfg.get("layers")
+    if not isinstance(raw_layers, list):
+        return _render_mock_layer_card()
+
+    cards = []
+    for item in raw_layers:
+        if not isinstance(item, dict):
+            continue
+        cards.append(_render_layer_card(item, len(cards) + 1))
+        if len(cards) >= 10:
+            break
+
+    if not cards:
+        return _render_mock_layer_card()
+
+    return "".join(cards)
+
+
+def _render_root_page(*, cfg: dict, layers_html: str = "", error: str = "", saved: bool = False) -> str:
     warning_html = (
         '<div style="padding:10px;background:#fff3cd;border:1px solid #ffeeba;margin:12px 0;">'
         'Perubahan config baru aktif setelah bot direstart.'
@@ -304,59 +417,7 @@ def _render_root_page(*, cfg: dict, error: str = "", saved: bool = False) -> str
       Tombol ini baru tampilan. Add/remove layer akan diaktifkan pada phase berikutnya.
     </div>
 
-    <div style="margin-top:10px;padding:10px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">
-      <div style="font-weight:800;margin-bottom:6px;">Layer Settings - Layer 1 (Mock, disabled)</div>
-
-      <div style="margin-top:8px;color:#333;line-height:1.6;">
-        <div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">
-          <input type="checkbox" disabled checked /> <span>enabled</span>
-          <span style="color:#666;">&nbsp;</span>
-        </div>
-
-        <div style="margin-bottom:6px;">name</div>
-        <div style="margin-bottom:10px;">
-          <input type="text" disabled value="L1" />
-        </div>
-
-        <div style="margin-bottom:6px;">lot</div>
-        <div style="margin-bottom:10px;">
-          <input type="text" disabled value="" placeholder="@@LOT@@" />
-        </div>
-
-        <div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">
-          <input type="checkbox" disabled checked /> <span>tp_enabled</span>
-        </div>
-
-        <div style="margin-bottom:6px;">tp_pips</div>
-        <div style="margin-bottom:10px;">
-          <input type="text" disabled value="" placeholder="@@TP1_PIPS@@" />
-        </div>
-
-        <div style="display:flex;gap:12px;align-items:center;margin-bottom:6px;">
-          <input type="checkbox" disabled /> <span>be_enabled</span>
-        </div>
-
-        <div style="margin-bottom:6px;">be_trigger_pips</div>
-        <div style="margin-bottom:10px;">
-          <input type="text" disabled value="50" />
-        </div>
-
-        <div style="margin-bottom:6px;">be_offset_pips</div>
-        <div style="margin-bottom:10px;">
-          <input type="text" disabled value="0" />
-        </div>
-
-        <div style="margin-bottom:6px;">comment</div>
-        <div style="margin-bottom:10px;">
-          <input type="text" disabled value="TG-L1" />
-        </div>
-
-        <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">
-          Input ini masih disabled. Penyimpanan layer akan dibuat pada phase berikutnya.
-        </div>
-      </div>
-    </div>
-
+    @@LAYERS_SECTION@@
 
     <div style="margin-top:10px;padding:10px;border-radius:8px;border:1px solid #e9ecef;background:#f8f9fa;">
       <div style="font-weight:800;margin-bottom:6px;">Field yang nanti bisa diatur</div>
@@ -565,6 +626,7 @@ async function botRestart() {
         "@@ERR_HTML@@": err_html,
         "@@WARNING_HTML@@": warning_html,
         "@@BOT_PROCESS_SECTION@@": bot_process_section_html,
+        "@@LAYERS_SECTION@@": layers_html,
     
     # also support legacy placeholder location (inside static template)
 
@@ -1096,8 +1158,10 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
         route = parsed.path
         try:
             saved = "saved" in parse_qs(parsed.query)
-            cfg = _safe_extract_allowed_keys(_safe_load_bot_config_json())
-            html_page = _render_root_page(cfg=cfg, saved=saved)
+            raw_cfg = _safe_load_bot_config_json()
+            cfg = _safe_extract_allowed_keys(raw_cfg)
+            layers_html = _render_layers_section(raw_cfg)
+            html_page = _render_root_page(cfg=cfg, layers_html=layers_html, saved=saved)
             self._send(200, "text/html; charset=utf-8", html_page.encode("utf-8"))
         except Exception as e:
             return self._send_root_error_response(e, route=route or "/")
@@ -1112,7 +1176,9 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(body_str, keep_blank_values=True)
         input_obj = {k: (v[0] if isinstance(v, list) and v else "") for k, v in parsed.items()}
 
-        prev_cfg = _safe_extract_allowed_keys(_safe_load_bot_config_json())
+        raw_cfg = _safe_load_bot_config_json()
+        prev_cfg = _safe_extract_allowed_keys(raw_cfg)
+        layers_html = _render_layers_section(raw_cfg)
 
         try:
             validated = _validate_and_build_settings_from_input(input_obj)
@@ -1121,7 +1187,7 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/?saved=1")
             self.end_headers()
         except Exception as e:
-            html = _render_root_page(cfg=prev_cfg, error=str(e), saved=False)
+            html = _render_root_page(cfg=prev_cfg, layers_html=layers_html, error=str(e), saved=False)
             self._send(200, "text/html; charset=utf-8", html.encode("utf-8"))
 
     def _handle_api_config(self):
