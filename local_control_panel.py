@@ -571,43 +571,43 @@ def _render_root_page(*, cfg: dict, layers_html: str = "", error: str = "", save
       <tr><th>source_chat_id</th><td><input type="text" name="source_chat_id" value="@@SOURCE_CHAT_ID@@" /></td></tr>
     </table>
 
+    <div style="padding:12px;background:#f8f9fa;border:1px solid #e9ecef;border-radius:10px;max-width:760px;margin:14px 0;">
+      <div style="font-weight:800;margin-bottom:6px;">Layer Settings</div>
+      <div style="color:#333;">
+        Fitur konfigurasi layer akan ditambahkan bertahap. Saat ini order execution masih memakai legacy logic.
+      </div>
+
+      <div style="margin-top:10px;">
+        <button type="button" disabled style="opacity:0.55; cursor:not-allowed;">+ Tambah Layer</button>
+      </div>
+      <div style="margin-top:6px;color:#666;">
+        Tombol ini baru tampilan. Add/remove layer akan diaktifkan pada phase berikutnya.
+      </div>
+
+      @@LAYERS_SECTION@@
+
+      <div style="margin-top:10px;padding:10px;border-radius:8px;border:1px solid #e9ecef;background:#f8f9fa;">
+        <div style="font-weight:800;margin-bottom:6px;">Field yang nanti bisa diatur</div>
+        <ul style="margin:0;padding-left:18px;color:#333;line-height:1.7;">
+          <li>Aktif / nonaktif layer</li>
+          <li>Nama layer</li>
+          <li>Lot per layer</li>
+          <li>TP aktif / nonaktif</li>
+          <li>TP pips</li>
+          <li>BE aktif / nonaktif</li>
+          <li>BE trigger pips</li>
+          <li>BE offset pips</li>
+          <li>Comment order</li>
+        </ul>
+      </div>
+
+      <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">
+        Layer config belum dipakai untuk order sampai phase berikutnya.
+      </div>
+    </div>
+
     <p><button type="submit">Simpan</button></p>
   </form>
-
-  <div style="padding:12px;background:#f8f9fa;border:1px solid #e9ecef;border-radius:10px;max-width:760px;margin:14px 0;">
-    <div style="font-weight:800;margin-bottom:6px;">Layer Settings</div>
-    <div style="color:#333;">
-      Fitur konfigurasi layer akan ditambahkan bertahap. Saat ini order execution masih memakai legacy logic.
-    </div>
-
-    <div style="margin-top:10px;">
-      <button type="button" disabled style="opacity:0.55; cursor:not-allowed;">+ Tambah Layer</button>
-    </div>
-    <div style="margin-top:6px;color:#666;">
-      Tombol ini baru tampilan. Add/remove layer akan diaktifkan pada phase berikutnya.
-    </div>
-
-    @@LAYERS_SECTION@@
-
-    <div style="margin-top:10px;padding:10px;border-radius:8px;border:1px solid #e9ecef;background:#f8f9fa;">
-      <div style="font-weight:800;margin-bottom:6px;">Field yang nanti bisa diatur</div>
-      <ul style="margin:0;padding-left:18px;color:#333;line-height:1.7;">
-        <li>Aktif / nonaktif layer</li>
-        <li>Nama layer</li>
-        <li>Lot per layer</li>
-        <li>TP aktif / nonaktif</li>
-        <li>TP pips</li>
-        <li>BE aktif / nonaktif</li>
-        <li>BE trigger pips</li>
-        <li>BE offset pips</li>
-        <li>Comment order</li>
-      </ul>
-    </div>
-
-    <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">
-      Layer config belum dipakai untuk order sampai phase berikutnya.
-    </div>
-  </div>
 
   <h2>Status</h2>
   <div>
