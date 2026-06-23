@@ -20,6 +20,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 STOP_TIMEOUT_SECONDS = 10
 STACK_LOCK_PATH = BASE_DIR / "run_bot.stack.lock"
+STOP_REQUEST_PATH = BASE_DIR / "run_bot.stop"
 STACK_RUNNING_MESSAGE = (
     "Another BOT_TRADING_TELEGRAM bot stack is already running. "
     "Stop it before starting a new one."
@@ -264,6 +265,12 @@ def main() -> int:
         print(STACK_RUNNING_MESSAGE, flush=True)
         return 1
 
+    # Clean up any stale stop request file
+    try:
+        if STOP_REQUEST_PATH.exists():
+            STOP_REQUEST_PATH.unlink()
+    except Exception:
+        pass
 
     with _SingleInstanceGuard(STACK_LOCK_PATH) as lock_acquired:
         if not lock_acquired:
@@ -293,6 +300,17 @@ def main() -> int:
 
         try:
             while True:
+                # Check if stop was requested via stop request file
+                if STOP_REQUEST_PATH.exists():
+                    with print_lock:
+                        print("[RUNNER] Stop requested via stop request file; stopping child processes.", flush=True)
+                    _stop_all(processes)
+                    try:
+                        STOP_REQUEST_PATH.unlink()
+                    except Exception:
+                        pass
+                    return 0
+
                 for name, process in (("telegram_listener.py", telegram), ("be_monitor.py", be_monitor)):
                     return_code = process.poll()
                     if return_code is not None:

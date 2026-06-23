@@ -249,14 +249,26 @@ def _render_root_page(*, cfg: dict, error: str = "", saved: bool = False) -> str
     th { background: #f6f6f6; text-align: left; }
     code { background: #f6f6f6; padding: 2px 4px; border-radius: 3px; }
     input[type="text"] { width: 220px; }
+
+    .status-banner{display:flex;align-items:center;gap:12px;padding:12px 14px;margin:12px 0;border-radius:10px;border:1px solid #e9ecef;background:#f8f9fa;}
+    .status-light{width:18px;height:18px;border-radius:50%;background:#999;box-shadow:0 0 0 4px rgba(0,0,0,0.03);}
+    .status-light.green{background:#28a745;}
+    .status-light.red{background:#dc3545;}
+    .status-light.yellow{background:#ffc107;}
+    .status-banner .status-text{font-weight:800;letter-spacing:0.2px;}
   </style>
 </head>
 <body>
   <h1>BOT TRADING TELEGRAM CONTROL PANEL</h1>
 
+  @@STATUS_LIGHT_BANNER@@
   @@MSG_HTML@@
+
+
+
   @@ERR_HTML@@
   @@WARNING_HTML@@
+
 
   <h2>Config (Safe Fields)</h2>
   <form method="POST" action="/config">
@@ -283,15 +295,14 @@ def _render_root_page(*, cfg: dict, error: str = "", saved: bool = False) -> str
 
 <h2>Bot Controls</h2>
   <div style="padding:10px;background:#f8f9fa;border:1px solid #e9ecef;margin:10px 0;">
-    <div style="margin-bottom:8px;color:#333;">Phase 3D: process control only (localhost)</div>
+    <div style="margin-bottom:8px;color:#333;">Phase 3E: safe process control (localhost)</div>
     <button type="button" onclick="botStart()">Start Bot</button>
     <button type="button" onclick="botStop()" style="margin-left:8px;">Stop Bot</button>
     <button type="button" onclick="return false;" id="btnRestart" style="margin-left:8px; opacity:0.55;" disabled>Restart disabled - use Stop then Start</button>
 
-    <div id="botActionMsg" style="margin-top:10px; color:#333;"></div>
-  </div>
-
-  <h2>Bot Process Status</h2>
+    <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;">
+      Stop Bot uses a safe stop request handled by run_bot.py. No processes are killed by the panel.
+    </div>
   @@BOT_PROCESS_SECTION@@
 
 <script>
@@ -422,11 +433,50 @@ async function botRestart() {
         )
 
     # Manual placeholder replacement (no string.Template dependency)
+    # Bot status light logic (PHASE 3F UI only)
+    try:
+        status = _compute_bot_stack_status()
+        bot_stack_running = bool(status.get("bot_stack_running", False))
+        run_bot_running = bool(status.get("run_bot_running", False))
+        telegram_listener_running = bool(status.get("telegram_listener_running", False))
+        be_monitor_running = bool(status.get("be_monitor_running", False))
+        any_process_running = bool(run_bot_running or telegram_listener_running or be_monitor_running)
+
+        if bot_stack_running:
+            light_class = "green"
+            status_text = "BOT RUNNING"
+        else:
+            if not any_process_running:
+                light_class = "red"
+                status_text = "BOT STOPPED"
+            else:
+                light_class = "yellow"
+                status_text = "BOT PARTIAL / CHECK NEEDED"
+
+        status_light_banner_html = (
+            '<div class="status-banner">'
+            f'<span class="status-light {light_class}"></span>'
+            f'<span class="status-text">{_html_escape(status_text)}</span>'
+            '</div>'
+        )
+    except Exception:
+        status_light_banner_html = (
+            '<div class="status-banner">'
+            '<span class="status-light red"></span>'
+            '<span class="status-text">BOT STOPPED</span>'
+            '</div>'
+        )
+
     replacements = {
+        "@@STATUS_LIGHT_BANNER@@": status_light_banner_html,
         "@@MSG_HTML@@": msg_html,
         "@@ERR_HTML@@": err_html,
         "@@WARNING_HTML@@": warning_html,
         "@@BOT_PROCESS_SECTION@@": bot_process_section_html,
+    
+    # also support legacy placeholder location (inside static template)
+
+
 
         "@@LOT@@": _html_escape(val("lot")),
         "@@PIP@@": _html_escape(val("pip")),
@@ -463,13 +513,12 @@ def _inspect_bot_processes_windows() -> dict:
     from subprocess import PIPE
 
     # Return ONLY the required raw properties.
-    # Avoid returning PowerShell itself by filtering by CommandLine content.
-    # Also exclude generic python processes by requiring CommandLine matches our bot scripts.
+    # Avoid returning PowerShell itself by filtering on exact bot script names.
+    # This prevents using the project path alone to select targets.
     ps_cmd = (
         "$procs = Get-CimInstance Win32_Process | Where-Object {"
         "($_.Name -match 'python') -and "
-        "($_.CommandLine -match 'BOT_TRADING_TELEGRAM|run_bot\\.py|telegram_listener\\.py|be_monitor\\.py')"
-
+        "(($_.CommandLine -match 'run_bot\\.py') -or ($_.CommandLine -match 'telegram_listener\\.py') -or ($_.CommandLine -match 'be_monitor\\.py'))"
         "};"
         "$procs | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine |"
         "ConvertTo-Json -Compress"
@@ -532,9 +581,7 @@ def _inspect_bot_processes_windows() -> dict:
                 # Exclude local_control_panel.py and any other scripts from bot process view.
                 continue
 
-
             # executable_kind: venv if .venv in path or cmd
-
             executable_kind = "venv" if (".venv" in executable_path.lower() or ".venv" in cmd_lower) else "global"
 
             # command_hint: do not show full cmd line
@@ -552,6 +599,7 @@ def _inspect_bot_processes_windows() -> dict:
                     "script": script,
                     "executable_kind": executable_kind,
                     "command_hint": command_hint,
+                    "command_line": command_line,
                 }
             )
 
@@ -697,10 +745,20 @@ def _start_bot_stack() -> dict:
 
     Non-blocking: uses subprocess.Popen.
     Redirects stdout/stderr to run_bot.panel.log.
+    
+    Removes stale run_bot.stop before starting to ensure clean startup.
     """
     status_before = _compute_bot_stack_status()
     if status_before.get("bot_stack_running") is True:
         return {"ok": False, "http_code": 409, "message": "Bot stack already running", "bot_status": status_before}
+
+    # Clean up stale stop request file before starting
+    stop_request_path = BASE_DIR / "run_bot.stop"
+    try:
+        if stop_request_path.exists():
+            stop_request_path.unlink()
+    except Exception:
+        pass
 
     venv_python = (BASE_DIR / ".venv" / "Scripts" / "python.exe").resolve()
     script_path = (BASE_DIR / "run_bot.py").resolve()
@@ -737,29 +795,59 @@ def _start_bot_stack() -> dict:
 
 
 def _stop_bot_stack() -> dict:
-    """Stop targeted bot processes only (run_bot.py / telegram_listener.py / be_monitor.py)."""
+    """Request bot stack to stop via stop request file.
+
+    Safe approach: does NOT kill any PIDs directly.
+    Instead, writes a stop request file that run_bot.py monitors.
+    run_bot.py gracefully stops its own child processes and removes the file.
+    
+    This ensures local_control_panel.py never kills itself.
+    """
     status_before = _compute_bot_stack_status()
 
     # If none of the target scripts are running, refuse.
-    any_running = bool(status_before.get("run_bot_running") or status_before.get("telegram_listener_running") or status_before.get("be_monitor_running"))
+    any_running = bool(
+        status_before.get("run_bot_running")
+        or status_before.get("telegram_listener_running")
+        or status_before.get("be_monitor_running")
+    )
     if not any_running:
         return {"ok": False, "http_code": 409, "message": "Bot stack not running", "bot_status": status_before}
 
-    pids = _bot_stack_pids_strict()
-    if not pids:
-        # Targeted scan failed; do not proceed to broad kills.
+    # Write stop request file that run_bot.py monitors
+    stop_request_path = BASE_DIR / "run_bot.stop"
+    try:
+        stop_request_path.write_text("stop_requested\n", encoding="utf-8")
+    except Exception as e:
         return {
             "ok": False,
             "http_code": 500,
-            "message": "Could not identify target bot process PIDs for shutdown",
+            "message": f"Failed to write stop request: {str(e)}",
             "bot_status": status_before,
         }
 
-    _terminate_pids(pids, timeout_seconds=3.0)
+    # Wait briefly and poll status a few times to verify stop is progressing
+    for _ in range(5):
+        time.sleep(0.5)
+        status_poll = _compute_bot_stack_status()
+        # If bot has already stopped, return immediately
+        any_still_running = bool(
+            status_poll.get("run_bot_running")
+            or status_poll.get("telegram_listener_running")
+            or status_poll.get("be_monitor_running")
+        )
+        if not any_still_running:
+            return {"ok": True, "http_code": 200, "message": "Bot stop requested and confirmed stopped", "bot_status": status_poll}
 
-    time.sleep(1.0)
+    # Bot still running, but stop request was sent successfully
     status_after = _compute_bot_stack_status()
-    return {"ok": True, "http_code": 200, "message": "Bot stack stop requested", "bot_status": status_after}
+    return {
+        "ok": True,
+        "http_code": 200,
+        "message": "Bot stop requested; shutdown still in progress",
+        "bot_status": status_after,
+    }
+
 
 
 def _restart_bot_stack() -> dict:
@@ -986,18 +1074,17 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
             elif action == "stop":
                 resp = _stop_bot_stack()
             elif action == "restart":
-                # Safety: restart is temporarily disabled (Phase 3D).
                 resp = {
                     "ok": False,
                     "http_code": 409,
-                    "message": "Restart is temporarily disabled. Use Stop Bot then Start Bot.",
+                    "message": "Restart is temporarily disabled. Use Stop then Start.",
                     "bot_status": _compute_bot_stack_status(),
                 }
             elif action == "restart_disabled":
                 resp = {
                     "ok": False,
                     "http_code": 409,
-                    "message": "Restart is temporarily disabled. Use Stop Bot then Start Bot.",
+                    "message": "Restart is temporarily disabled. Use Stop then Start.",
                     "bot_status": _compute_bot_stack_status(),
                 }
             else:
