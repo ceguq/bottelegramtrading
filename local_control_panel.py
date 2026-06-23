@@ -246,6 +246,19 @@ def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0) ->
             return default
         return str(val).strip()
 
+    def is_checkbox_checked(value: str) -> bool:
+        """Robustly detect if a checkbox value should be rendered as checked.
+        
+        Treats true, "true", "1", "yes", "on" as checked.
+        Treats false, "false", "0", "no", "off" as unchecked.
+        """
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+        return False
+
     enabled_val = get_field("enabled", "true")
     name_val = get_field("name", "L1")
     lot_val = get_field("lot", "")
@@ -258,7 +271,7 @@ def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0) ->
 
     # Helper to render checkbox with hidden field for form submission
     def checkbox_row(label: str, field_name: str, is_checked: bool) -> str:
-        checked_str = "checked" if is_checked else ""
+        checked_str = 'checked="checked"' if is_checked else ""
         return (
             '<div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;">'
             f'<input type="hidden" name="layers[{idx}][{field_name}]" value="false" />'
@@ -280,12 +293,12 @@ def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0) ->
         '<div style="margin-top:10px;padding:12px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">'
         f'<div style="font-weight:800;margin-bottom:12px;">Layer Settings - Layer {_html_escape(str(idx + 1))}</div>'
         '<div style="margin-top:8px;color:#333;line-height:1.8;">'
-        + checkbox_row("enabled", "enabled", enabled_val == "true")
+        + checkbox_row("enabled", "enabled", is_checkbox_checked(enabled_val))
         + text_row("name", "name", name_val)
         + text_row("lot", "lot", lot_val, "e.g., 0.01")
-        + checkbox_row("tp_enabled", "tp_enabled", tp_enabled_val == "true")
+        + checkbox_row("tp_enabled", "tp_enabled", is_checkbox_checked(tp_enabled_val))
         + text_row("tp_pips", "tp_pips", tp_pips_val, "e.g., 50")
-        + checkbox_row("be_enabled", "be_enabled", be_enabled_val == "true")
+        + checkbox_row("be_enabled", "be_enabled", is_checkbox_checked(be_enabled_val))
         + text_row("be_trigger_pips", "be_trigger_pips", be_trigger_pips_val)
         + text_row("be_offset_pips", "be_offset_pips", be_offset_pips_val)
         + text_row("comment", "comment", comment_val)
