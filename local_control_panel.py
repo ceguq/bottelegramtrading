@@ -181,21 +181,25 @@ def _validate_and_build_settings_from_input(input_obj: dict) -> dict:
 def _write_bot_config_with_backup(new_config: dict) -> None:
     cfg_path = BASE_DIR / "bot_config.json"
     backup_path = BASE_DIR / "bot_config.backup.json"
+    tmp_path = BASE_DIR / "bot_config.tmp.json"
 
     prev = _safe_load_bot_config_json()
-    prev_sanitized = _safe_extract_allowed_keys(prev)
+    prev_dict = dict(prev) if isinstance(prev, dict) else {}
 
-    # backup overwrite
+    merged = dict(prev_dict)
+    merged.update(_safe_extract_allowed_keys(new_config))
+
     backup_path.write_text(
-        json.dumps(prev_sanitized, indent=2) + "\n",
+        json.dumps(prev_dict, indent=2) + "\n",
         encoding="utf-8",
     )
 
-    # safe write (only safe keys)
-    cfg_path.write_text(
-        json.dumps(_safe_extract_allowed_keys(new_config), indent=2) + "\n",
+    tmp_path.write_text(
+        json.dumps(merged, indent=2) + "\n",
         encoding="utf-8",
     )
+
+    tmp_path.replace(cfg_path)
 
 
 def _build_sanitized_config_api() -> dict:
