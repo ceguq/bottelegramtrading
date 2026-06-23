@@ -133,6 +133,128 @@ def settings_to_dict(settings: BotSettings) -> dict[str, Any]:
     }
 
 
+# Runtime optional layers loader (Phase 3C)
+# - Must not alter legacy load_settings() behavior
+# - Must not wire layers into execution order yet
+
+def _as_non_empty_str(value: Any, *, key: str, max_len: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"Config key '{key}' must be a string; got: {type(value).__name__}")
+    s = value.strip()
+    if not s:
+        raise ValueError(f"Config key '{key}' must be a non-empty string")
+    if len(s) > max_len:
+        raise ValueError(f"Config key '{key}' must be at most {max_len} characters")
+    return s
+
+
+def _as_str_bool(value: Any, *, key: str) -> bool:
+    # Strict bool only; do not accept 0/1 strings etc here.
+    return _as_bool(value, key=key)
+
+
+def _as_positive_number(value: Any, *, key: str) -> float:
+    num = _as_number(value, key=key)
+    if not (num > 0):
+        raise ValueError(f"Config key '{key}' must be > 0; got: {num}")
+    return num
+
+
+def _as_int_ge(value: Any, *, key: str, min_value: int) -> int:
+    i = _as_int(value, key=key)
+    if i < min_value:
+        raise ValueError(f"Config key '{key}' must be >= {min_value}; got: {i}")
+    return i
+
+
+def load_runtime_layers(path: str | Path | None = None) -> list[dict[str, Any]] | None:
+    """Load and validate optional top-level runtime `layers` from bot_config.json.
+
+    Returns:
+        - None: if top-level `layers` key is missing (backward compatible)
+        - []: if `layers` exists but is an empty list
+        - list[dict]: normalized validated layers
+
+    Notes:
+        - This helper intentionally does NOT affect legacy load_settings().
+        - Runtime order execution is not wired to layers yet.
+    """
+
+    base_dir = Path(__file__).resolve().parent
+    config_path = Path(path) if path is not None else (base_dir / _DEFAULT_FILENAME)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"bot_config.json not found at: {config_path}")
+
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in config file {config_path}: {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Config root must be a JSON object; got: {type(data).__name__}")
+
+    if "layers" not in data:
+        return None
+
+    raw_layers = data["layers"]
+    if not isinstance(raw_layers, list):
+        # Must be "same style" of config error (ValueError with message, like load_settings)
+        raise ValueError(f"Config key 'layers' must be a list; got: {type(raw_layers).__name__}")
+
+    if len(raw_layers) == 0:
+        return []
+
+    # Validate at most 10 layers
+    if len(raw_layers) > 10:
+        raise ValueError(f"Config key 'layers' must contain at most 10 items; got: {len(raw_layers)}")
+
+    validated: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw_layers):
+        if not isinstance(item, dict):
+            raise ValueError(f"layers[{idx}] must be an object; got: {type(item).__name__}")
+
+        # required fields
+        enabled = _as_str_bool(_require_key(item, "enabled"), key="layers[].enabled")
+        name = _as_non_empty_str(_require_key(item, "name"), key="layers[].name", max_len=40)
+        lot = _as_positive_number(_require_key(item, "lot"), key="layers[].lot")
+        tp_enabled = _as_str_bool(_require_key(item, "tp_enabled"), key="layers[].tp_enabled")
+        tp_pips = _as_int_ge(_require_key(item, "tp_pips"), key="layers[].tp_pips", min_value=0)
+        if tp_enabled and tp_pips <= 0:
+            raise ValueError(
+                "layers[].tp_pips must be > 0 when tp_enabled is true"
+            )
+        be_enabled = _as_str_bool(_require_key(item, "be_enabled"), key="layers[].be_enabled")
+        be_trigger_pips = _as_int_ge(
+            _require_key(item, "be_trigger_pips"), key="layers[].be_trigger_pips", min_value=0
+        )
+        be_offset_pips = _as_int_ge(
+            _require_key(item, "be_offset_pips"), key="layers[].be_offset_pips", min_value=0
+        )
+        comment = _as_non_empty_str(_require_key(item, "comment"), key="layers[].comment", max_len=40)
+
+        validated.append(
+            {
+                "name": name,
+                "enabled": enabled,
+                "lot": lot,
+                "tp_enabled": tp_enabled,
+                "tp_pips": tp_pips,
+                "be_enabled": be_enabled,
+                "be_trigger_pips": be_trigger_pips,
+                "be_offset_pips": be_offset_pips,
+                "comment": comment,
+            }
+        )
+
+    return validated
+
+
+
+
+
+
 def _main() -> None:
     settings = load_settings()
     print(settings_to_dict(settings))
