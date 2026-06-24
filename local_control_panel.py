@@ -448,9 +448,11 @@ def _render_layers_section(raw_cfg: dict) -> str:
     note = (
         '<div style="margin-top:16px;padding:12px;border-radius:8px;background:#e7f3ff;border:1px solid #b3d9ff;color:#004085;font-size:14px;line-height:1.6;">'
         '<strong>ℹ️ Runtime Status:</strong><br/>'
-        'Runtime currently uses <strong>enabled</strong> and <strong>lot</strong> per layer.<br/>'
-        'TP/BE/comment fields are saved but not active yet.'
+'Runtime active: <strong>enabled</strong>, <strong>lot</strong>, <strong>TP</strong>.<br/>'
+        
+        'Saved only: <strong>BE</strong>, <strong>comment</strong>. MT5 comments remain fixed for BE tracking.'
         '</div>'
+
     )
     
     return layers_html + note

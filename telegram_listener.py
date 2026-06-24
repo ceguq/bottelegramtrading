@@ -564,8 +564,13 @@ async def handle_signal(event):
             print(f"Layer mapping: {mapping_str}")
 
             # Log ignored fields for this phase
-            logger.info("Layer BE/comment fields ignored in this phase")
-            print("Layer BE/comment fields ignored in this phase")
+            logger.info(
+                "Layer BE/comment saved only; runtime uses enabled/lot/TP. MT5 comments remain fixed for BE tracking."
+            )
+            print(
+                "Layer BE/comment saved only; runtime uses enabled/lot/TP. MT5 comments remain fixed for BE tracking."
+            )
+
 
     except Exception as exc:
         # Exception loading layers: skip signal (fail-safe)
