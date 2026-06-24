@@ -622,8 +622,26 @@ async def handle_signal(event):
         print(f"Stop Loss: {_u(check_result.get('sl') if isinstance(check_result, dict) else None)}")
         print(f"Current Bid: {_u(check_result.get('current_bid') if isinstance(check_result, dict) else None)}")
         print(f"Current Ask: {_u(check_result.get('current_ask') if isinstance(check_result, dict) else None)}")
-        print(f"Lot per order: {_u(check_result.get('volume') if isinstance(check_result, dict) else None)}")
-        print(f"Total planned lot: {_u(check_result.get('total_volume') if isinstance(check_result, dict) else None)}")
+        # Summary (prefer per-layer lots if available)
+        if isinstance(check_result, dict) and check_result.get("lots_per_order") is not None:
+            lots = check_result.get("lots_per_order")
+            enabled_orders = check_result.get("enabled_orders")
+            # keep print simple and stable
+            print(
+                f"Lots per order: "
+                f"{_u(lots[0] if isinstance(lots, list) and len(lots) > 0 else None)}, "
+                f"{_u(lots[1] if isinstance(lots, list) and len(lots) > 1 else None)}, "
+                f"{_u(lots[2] if isinstance(lots, list) and len(lots) > 2 else None)}"
+            )
+            print(
+                "Total planned lot: "
+                f"{_u(check_result.get('total_planned_lot'))}"
+            )
+        else:
+            # Backward compatibility
+            print(f"Lot per order: {_u(check_result.get('volume') if isinstance(check_result, dict) else None)}")
+            print(f"Total planned lot: {_u(check_result.get('total_volume') if isinstance(check_result, dict) else None)}")
+
         print(f"Trade stops level: {_u(broker.get('trade_stops_level') if isinstance(broker, dict) else None)}")
         print(f"Minimum distance: {_u(broker.get('minimum_distance') if isinstance(broker, dict) else None)}")
         print(f"Volume min: {_u(broker.get('volume_min') if isinstance(broker, dict) else None)}")

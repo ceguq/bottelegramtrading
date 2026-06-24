@@ -338,6 +338,12 @@ def check_orders(
     effective_lot = effective_lots[0]  # For result_data backward compat
 
 
+    # Compute per-order lot summary (disabled layers excluded)
+    lots_per_order = effective_lots[:]  # effective lots always represent requested layer lots
+    total_planned_lot = sum(
+        float(lots_per_order[i]) for i in range(3) if enabled_list[i] is True
+    )
+
     result_data = {
         "ok": False,
         "symbol": SYMBOL,
@@ -351,6 +357,10 @@ def check_orders(
         "current_ask": None,
         "volume": effective_lot,
         "total_volume": effective_lot * 3,
+        # New summary fields (used by TEST MODE console)
+        "lots_per_order": lots_per_order,
+        "enabled_orders": enabled_list,
+        "total_planned_lot": total_planned_lot,
         "broker": None,
         "orders": [],
         "error": None,
