@@ -498,6 +498,8 @@ async def handle_signal(event):
     # Load runtime layers to determine per-order lot_overrides and order_enabled
     lot_overrides = None
     order_enabled = None
+    tp_enabled_overrides = None
+    tp_pips_overrides = None
     try:
         layers = load_runtime_layers()
         if layers is None:
@@ -515,6 +517,8 @@ async def handle_signal(event):
             # Non-empty list: map layers[0:3] to orders[0:3]
             lot_overrides = [None, None, None]
             order_enabled = [True, True, True]
+            tp_enabled_overrides = [None, None, None]
+            tp_pips_overrides = [None, None, None]
             mapping_parts = []
             
             for order_idx in range(3):
@@ -524,12 +528,26 @@ async def handle_signal(event):
                     layer_enabled = layer.get("enabled", False)
                     layer_lot = layer.get("lot")
                     layer_name = layer.get("name", f"L{layer_num}")
-                    
+
+                    # Per-layer TP overrides
+                    tp_enabled = layer.get("tp_enabled", None)
+                    tp_pips = layer.get("tp_pips", None)
+
                     if layer_enabled:
                         # Layer enabled: use its lot
                         lot_overrides[order_idx] = layer_lot
                         order_enabled[order_idx] = True
-                        mapping_parts.append(f"{layer_name}=enabled lot={layer_lot}")
+
+                        tp_enabled_overrides[order_idx] = tp_enabled
+                        if tp_enabled is True:
+                            tp_pips_overrides[order_idx] = tp_pips
+                        elif tp_enabled is False:
+                            tp_pips_overrides[order_idx] = None
+
+                        tp_label = "off" if tp_enabled is False else f"{tp_pips}"
+                        mapping_parts.append(
+                            f"{layer_name}=enabled lot={layer_lot} tp={tp_label}"
+                        )
                     else:
                         # Layer disabled: skip this order only
                         order_enabled[order_idx] = False
@@ -544,10 +562,11 @@ async def handle_signal(event):
             mapping_str = ", ".join(mapping_parts)
             logger.info("Layer mapping: %s", mapping_str)
             print(f"Layer mapping: {mapping_str}")
-            
+
             # Log ignored fields for this phase
-            logger.info("Layer TP/BE/comment fields ignored in this phase; legacy TP ladder and BE still active")
-            print("Layer TP/BE/comment fields ignored in this phase; legacy TP ladder and BE still active")
+            logger.info("Layer BE/comment fields ignored in this phase")
+            print("Layer BE/comment fields ignored in this phase")
+
     except Exception as exc:
         # Exception loading layers: skip signal (fail-safe)
         logger.error("Exception loading runtime layers: %s; skipping signal", exc)
@@ -577,6 +596,8 @@ async def handle_signal(event):
                 None,  # lot_override (legacy)
                 lot_overrides,  # per-order lots
                 order_enabled,  # per-order enabled
+                tp_enabled_overrides,  # per-order TP enabled overrides
+                tp_pips_overrides,  # per-order TP pips overrides
             )
         except Exception:
             logger.exception("check_orders failed")
@@ -664,6 +685,8 @@ async def handle_signal(event):
             None,  # lot_override (legacy)
             lot_overrides,  # per-order lots
             order_enabled,  # per-order enabled
+            tp_enabled_overrides,  # per-order TP enabled overrides
+            tp_pips_overrides,  # per-order TP pips overrides
         )
     except Exception:
         logger.exception("Gagal mengirim order ke MT5.")
