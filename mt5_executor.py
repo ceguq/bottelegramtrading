@@ -280,15 +280,16 @@ def check_orders(
     for i, lot in enumerate(effective_lots):
         if not (lot > 0):
             raise ValueError(f"effective_lots[{i}] must be > 0; got: {lot}")
-    
+
     # Resolve order enabled status
     if order_enabled is not None:
         if not isinstance(order_enabled, list) or len(order_enabled) != 3:
             raise ValueError(f"order_enabled must be a list of 3 items; got: {order_enabled}")
         enabled_list = order_enabled
     else:
-        # Default: all orders enabled
         enabled_list = [True, True, True]
+
+    
     
     # Resolve TP enabled/pips with fallback for missing layers
     legacy_tp_enabled = [True, True, False]
@@ -1425,22 +1426,15 @@ def place_orders(
         if tp_enabled_list[i] is True:
             pips = tp_pips_list[i]
             if pips is None:
-                raise ValueError(f"tp_pips_list[{i}] must not be None when tp_enabled is True")
+                raise ValueError(
+                    f"tp_pips_list[{i}] must not be None when tp_enabled is True"
+                )
             pips_num = float(pips)
             if pips_num <= 0:
                 raise ValueError(f"tp_pips_list[{i}] must be > 0; got: {pips_num}")
-            raise ValueError(f"effective_lots[{i}] must be > 0; got: {lot}")
-    
-    # Resolve order enabled status
-    if order_enabled is not None:
-        if not isinstance(order_enabled, list) or len(order_enabled) != 3:
-            raise ValueError(f"order_enabled must be a list of 3 items; got: {order_enabled}")
-        enabled_list = order_enabled
-    else:
-        # Default: all orders enabled
-        enabled_list = [True, True, True]
 
     tickets = []
+
 
     try:
         if connect() is not True:
