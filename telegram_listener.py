@@ -652,7 +652,11 @@ async def handle_signal(event):
         print(f"Volume min: {_u(broker.get('volume_min') if isinstance(broker, dict) else None)}")
         print(f"Volume max: {_u(broker.get('volume_max') if isinstance(broker, dict) else None)}")
         print(f"Volume step: {_u(broker.get('volume_step') if isinstance(broker, dict) else None)}")
-        print(f"Error: {_u(check_result.get('error') if isinstance(check_result, dict) else None)}")
+        overall_error = check_result.get("error") if isinstance(check_result, dict) else None
+        overall_error_str = str(overall_error) if overall_error is not None else ""
+        if overall_error not in (None, "", "Unavailable") and overall_error_str not in ("Unavailable",):
+            print(f"Error: {_u(overall_error)}")
+
 
         for order in (check_result.get("orders", []) if isinstance(check_result, dict) else []):
             req = order.get("request") if isinstance(order, dict) else None
@@ -666,7 +670,11 @@ async def handle_signal(event):
             print(f"Result: {_u('OK' if order.get('ok') is True else 'FAIL' if order.get('ok') is False else None) if isinstance(order, dict) else 'Unavailable'}")
             print(f"Retcode: {_u(order.get('retcode') if isinstance(order, dict) else None)}")
             print(f"Comment: {_u(order.get('comment') if isinstance(order, dict) else None)}")
-            print(f"Error: {_u(order.get('error') if isinstance(order, dict) else None)}")
+            order_error = order.get("error") if isinstance(order, dict) else None
+            order_error_str = str(order_error) if order_error is not None else ""
+            if order_error not in (None, "", "Unavailable") and order_error_str not in ("Unavailable",):
+                print(f"Error: {_u(order_error)}")
+
 
         return
 
