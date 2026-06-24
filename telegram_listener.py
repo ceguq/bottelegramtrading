@@ -57,6 +57,47 @@ SOURCE_CHAT_ID = -1003511779760  # Signal channel/group/chat ID from cari_chat_i
 # IMPORTANT: SOURCE_CHAT_ID must be defined before the @client.on decorator.
 settings = load_settings()
 
+# --- Startup safety banner (config-driven) ---
+# Must be printed after config/settings are loaded and before listening for signals.
+startup_test_mode = bool(getattr(settings, "telegram_test_mode", True))
+
+try:
+    startup_allow_real_order = load_allow_real_order()
+except Exception:
+    # Fail safe: treat as not allowed; banner indicates blocked.
+    startup_allow_real_order = None
+
+if startup_test_mode is True:
+
+    print(
+        "\n====== BOT SAFETY MODE ======\n"
+        "BOT MODE: TEST MODE\n"
+        "REAL ORDER: LOCKED\n"
+        "MT5 order_send disabled; order_check only.\n"
+        "==============================\n",
+        flush=True,
+    )
+elif startup_allow_real_order is not True:
+    print(
+        "\n====== BOT SAFETY MODE ======\n"
+        "BOT MODE: REAL REQUESTED BUT BLOCKED\n"
+        "REAL ORDER: LOCKED\n"
+        "allow_real_order is not true.\n"
+        "==============================\n",
+        flush=True,
+    )
+else:
+    print(
+        "\n====== BOT SAFETY MODE ======\n"
+        "BOT MODE: REAL\n"
+        "REAL ORDER: ENABLED\n"
+        "WARNING: order_send can place real MT5 orders.\n"
+        "==============================\n",
+        flush=True,
+    )
+
+
+
 LOT = settings.lot  # Lot size for each pending order
 PIP = settings.pip  # 1 pip = 0.1 for XAUUSD
 TP1_PIPS = settings.tp1_pips  # Pips for Order 1 take profit
