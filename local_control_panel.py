@@ -449,8 +449,9 @@ def _render_layers_section(raw_cfg: dict) -> str:
         '<div style="margin-top:16px;padding:12px;border-radius:8px;background:#e7f3ff;border:1px solid #b3d9ff;color:#004085;font-size:14px;line-height:1.6;">'
         '<strong>ℹ️ Runtime Status:</strong><br/>'
 'Runtime active: <strong>enabled</strong>, <strong>lot</strong>, <strong>TP</strong>.<br/>'
-        
-        'Saved only: <strong>BE</strong>, <strong>comment</strong>. MT5 comments remain fixed for BE tracking.'
+        'Saved only: <strong>BE</strong>, <strong>comment</strong>. MT5 comments remain fixed for BE tracking.<br/><br/>'
+        '<strong>Safe reset command:</strong><br/>'
+'<code>.\\.venv\\Scripts\\python.exe .\\reset_safe_layers.py --apply</code>'
         '</div>'
 
     )
