@@ -130,6 +130,10 @@ CHAT_TP_PATTERN = re.compile(
     r"^\s*tp\s*(?P<index>[123])\s*[:=\-]?\s*(?P<pips>\d+(?:\.\d+)?)\s*(?:pips?\b)?",
     re.IGNORECASE | re.MULTILINE,
 )
+DEFAULT_TP_LINE_PATTERN = re.compile(
+    r"^\s*(?:tp\s*[123]\b|tp[123]\b)",
+    re.IGNORECASE,
+)
 
 # In-memory dedup store for Telegram messages: chat_id + message_id
 _dedup_store: dict[str, bool] = {}
@@ -195,6 +199,14 @@ def _parse_chat_tp_pips(text: str) -> list[float | None]:
         parsed[order_idx] = int(pips_num) if pips_num.is_integer() else pips_num
 
     return parsed
+
+
+def _strip_default_tp_lines(text: str) -> str:
+    return "\n".join(
+        line
+        for line in str(text).splitlines()
+        if DEFAULT_TP_LINE_PATTERN.search(line) is None
+    )
 
 
 def _find_signal_entry(text: str):
@@ -275,19 +287,22 @@ def parse_signal(text: str) -> dict | None:
 
         return None
 
-    direction_match, range_match = _find_signal_entry(text)
-    sl_match = SL_PATTERN.search(text)
+    signal_style = _detect_signal_style(text)
+    if signal_style in ("intraday", "swing"):
+        signal_text = text
+        chat_tp_pips = _parse_chat_tp_pips(text)
+    else:
+        signal_text = _strip_default_tp_lines(text)
+        chat_tp_pips = [None, None, None]
+
+    direction_match, range_match = _find_signal_entry(signal_text)
+    sl_match = SL_PATTERN.search(signal_text)
     if direction_match is None or range_match is None:
         return None
 
     # Token strings; final per-order entries are resolved later.
     token_a = range_match.group("price_a")
     token_b = range_match.group("price_b")
-    signal_style = _detect_signal_style(text)
-    if signal_style in ("intraday", "swing"):
-        chat_tp_pips = _parse_chat_tp_pips(text)
-    else:
-        chat_tp_pips = [None, None, None]
 
     return {
         "direction": _normalize_direction(direction_match.group("direction")),
