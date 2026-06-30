@@ -125,6 +125,11 @@ PRICE_RANGE_PATTERN = re.compile(
 )
 DIRECTION_PATTERN = re.compile(r"\b(?P<direction>buy|sell|sel)\b", re.IGNORECASE)
 SL_PATTERN = re.compile(r"\bsl\b\s*[:=]?\s*(?P<sl>\d+(?:\.\d+)?)", re.IGNORECASE)
+SIGNAL_STYLE_PATTERN = re.compile(r"\b(?P<style>intraday|swing)\b", re.IGNORECASE)
+CHAT_TP_PATTERN = re.compile(
+    r"^\s*tp\s*(?P<index>[123])\s*[:=\-]?\s*(?P<pips>\d+(?:\.\d+)?)\s*(?:pips?\b)?",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # In-memory dedup store for Telegram messages: chat_id + message_id
 _dedup_store: dict[str, bool] = {}
@@ -165,6 +170,52 @@ def _normalize_direction(direction: str) -> str:
     if direction == "sel":
         return "sell"
     return direction
+
+
+def _detect_signal_style(text: str) -> str:
+    style_match = SIGNAL_STYLE_PATTERN.search(text or "")
+    if style_match is None:
+        return "scalping/default"
+    return style_match.group("style").lower()
+
+
+def _parse_chat_tp_pips(text: str) -> list[float | None]:
+    parsed: list[float | None] = [None, None, None]
+    if not text:
+        return parsed
+
+    for match in CHAT_TP_PATTERN.finditer(text):
+        order_idx = int(match.group("index")) - 1
+        try:
+            pips_num = float(match.group("pips"))
+        except (TypeError, ValueError):
+            continue
+        if pips_num <= 0:
+            continue
+        parsed[order_idx] = int(pips_num) if pips_num.is_integer() else pips_num
+
+    return parsed
+
+
+def _find_signal_entry(text: str):
+    direction_match = DIRECTION_PATTERN.search(text)
+    if direction_match is None:
+        return None, None
+
+    for line in text.splitlines():
+        line_direction_match = DIRECTION_PATTERN.search(line)
+        line_range_match = PRICE_RANGE_PATTERN.search(line)
+        if line_direction_match is not None and line_range_match is not None:
+            return line_direction_match, line_range_match
+
+    for line in text.splitlines():
+        if line.lstrip().lower().startswith("tp"):
+            continue
+        line_range_match = PRICE_RANGE_PATTERN.search(line)
+        if line_range_match is not None:
+            return direction_match, line_range_match
+
+    return direction_match, None
 
 
 def _is_short_integer(token: str | None) -> bool:
@@ -224,18 +275,16 @@ def parse_signal(text: str) -> dict | None:
 
         return None
 
-    direction_match = DIRECTION_PATTERN.search(text)
-    if direction_match is None:
-        return None
-
-    range_match = PRICE_RANGE_PATTERN.search(text)
+    direction_match, range_match = _find_signal_entry(text)
     sl_match = SL_PATTERN.search(text)
-    if range_match is None:
+    if direction_match is None or range_match is None:
         return None
 
     # Token strings; final per-order entries are resolved later.
     token_a = range_match.group("price_a")
     token_b = range_match.group("price_b")
+    signal_style = _detect_signal_style(text)
+    chat_tp_pips = _parse_chat_tp_pips(text)
 
     return {
         "direction": _normalize_direction(direction_match.group("direction")),
@@ -243,6 +292,8 @@ def parse_signal(text: str) -> dict | None:
         "raw_entry_second": token_b,
         "raw_range": f"{token_a}-{token_b}",
         "raw_sl": sl_match.group("sl") if sl_match is not None else None,
+        "signal_style": signal_style,
+        "chat_tp_pips": chat_tp_pips,
     }
 
 
@@ -502,9 +553,14 @@ async def handle_signal(event):
         print("Signal rejected:", exc)
         return
     signal.update(order_plan)
+    signal_style = signal.get("signal_style", "scalping/default")
+    chat_tp_pips = signal.get("chat_tp_pips")
+    if not isinstance(chat_tp_pips, list) or len(chat_tp_pips) != 3:
+        chat_tp_pips = [None, None, None]
+    tp_source = "chat_message" if signal_style in ("intraday", "swing") else "layer_config"
 
     logger.info(
-        "Signal valid direction=%s raw_range=%s expanded_range=%s mode=%s entry_first=%s entry_second=%s entry_third=%s raw_sl=%s expanded_sl=%s sl_source=%s final_sl=%s tp1=%s tp2=%s tp3=NO TP",
+        "Signal valid direction=%s raw_range=%s expanded_range=%s mode=%s entry_first=%s entry_second=%s entry_third=%s raw_sl=%s expanded_sl=%s sl_source=%s final_sl=%s",
         signal["direction"],
         signal.get("raw_range"),
         signal["expanded_range"],
@@ -516,11 +572,23 @@ async def handle_signal(event):
         signal.get("expanded_sl"),
         signal["sl_source"],
         signal["sl"],
-        signal["tp1_target"],
-        signal["tp2_target"],
+    )
+    logger.info("Signal style: %s", signal_style)
+    logger.info("TP source: %s", tp_source)
+    logger.info(
+        "Parsed chat TP pips: tp1=%s, tp2=%s, tp3=%s",
+        chat_tp_pips[0],
+        chat_tp_pips[1],
+        chat_tp_pips[2],
     )
 
     print("Direction:", signal["direction"].upper())
+    print("Signal style:", signal_style)
+    print("TP source:", tp_source)
+    print(
+        "Parsed chat TP pips: "
+        f"tp1={chat_tp_pips[0]}, tp2={chat_tp_pips[1]}, tp3={chat_tp_pips[2]}"
+    )
     print("Reference price:", reference_price)
     print("Raw entry range:", f"{raw_first}-{raw_second}")
     print("Expanded range:", signal["expanded_range"])
@@ -532,9 +600,12 @@ async def handle_signal(event):
     print("Raw SL:", raw_sl)
     print("Expanded raw SL:", signal.get("expanded_sl"))
     print("Final SL sent to MT5:", signal["sl"])
-    print("TP1 target:", signal["tp1_target"])
-    print("TP2 target:", signal["tp2_target"])
-    print("Layer 3 / TG-NO-TP: NO TP")
+    if tp_source == "layer_config":
+        print("TP1 target:", signal["tp1_target"])
+        print("TP2 target:", signal["tp2_target"])
+        print("Layer 3 / TG-NO-TP: layer config/default")
+    else:
+        print("Chat TP pips override matching layer TP pips for this signal only")
 
     # Load runtime layers to determine per-order lot_overrides and order_enabled
     lot_overrides = None
@@ -618,6 +689,37 @@ async def handle_signal(event):
         logger.error("Exception loading runtime layers: %s; skipping signal", exc)
         print(f"Exception loading runtime layers: {exc}; skipping signal")
         return
+
+    if tp_source == "chat_message":
+        if tp_enabled_overrides is None:
+            tp_enabled_overrides = [None, None, None]
+        if tp_pips_overrides is None:
+            tp_pips_overrides = [None, None, None]
+
+        chat_override_parts = []
+        for order_idx, chat_pips in enumerate(chat_tp_pips):
+            layer_num = order_idx + 1
+            if chat_pips is None:
+                chat_override_parts.append(f"tp{layer_num}=preserve_config")
+                continue
+            tp_enabled_overrides[order_idx] = True
+            tp_pips_overrides[order_idx] = chat_pips
+            chat_override_parts.append(f"tp{layer_num}={chat_pips}")
+
+        chat_override_log = ", ".join(chat_override_parts)
+        logger.info("Chat TP override result: %s", chat_override_log)
+        logger.info(
+            "Effective TP overrides after source selection: enabled=%s pips=%s",
+            tp_enabled_overrides,
+            tp_pips_overrides,
+        )
+        print(f"Chat TP override result: {chat_override_log}")
+        print(
+            "Effective TP overrides after source selection: "
+            f"enabled={tp_enabled_overrides} pips={tp_pips_overrides}"
+        )
+    else:
+        logger.info("Effective TP source remains layer_config")
 
     # TEST MODE path
     if TELEGRAM_TEST_MODE is True:

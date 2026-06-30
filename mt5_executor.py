@@ -459,6 +459,7 @@ def check_orders(
         # Legacy variable names for validation compatibility
         tp1 = tp_levels[0]
         tp2 = tp_levels[1]
+        tp3 = tp_levels[2]
         
         result_data["sl"] = sl_actual
 
@@ -501,10 +502,16 @@ def check_orders(
                         f"TG-TP2 level invalid: sl_actual={sl_actual}, entry_second={entry_second_norm}"
                     )
             
-            if not (sl_actual < entry_third_norm):
-                errors.append(
-                    f"{TP3_COMMENT} level invalid: sl_actual={sl_actual}, entry_third={entry_third_norm}"
-                )
+            if tp3 is not None:
+                if not (sl_actual < entry_third_norm < tp3):
+                    errors.append(
+                        f"{TP3_COMMENT} level invalid: sl_actual={sl_actual}, entry_third={entry_third_norm}, tp3={tp3}"
+                    )
+            else:
+                if not (sl_actual < entry_third_norm):
+                    errors.append(
+                        f"{TP3_COMMENT} level invalid: sl_actual={sl_actual}, entry_third={entry_third_norm}"
+                    )
         else:
             # SELL: TP < entry if TP exists; no-TP layer only needs entry < SL.
             if tp1 is not None:
@@ -529,10 +536,16 @@ def check_orders(
                         f"TG-TP2 level invalid: entry_second={entry_second_norm}, sl_actual={sl_actual}"
                     )
             
-            if not (entry_third_norm < sl_actual):
-                errors.append(
-                    f"{TP3_COMMENT} level invalid: entry_third={entry_third_norm}, sl_actual={sl_actual}"
-                )
+            if tp3 is not None:
+                if not (tp3 < entry_third_norm < sl_actual):
+                    errors.append(
+                        f"{TP3_COMMENT} level invalid: tp3={tp3}, entry_third={entry_third_norm}, sl_actual={sl_actual}"
+                    )
+            else:
+                if not (entry_third_norm < sl_actual):
+                    errors.append(
+                        f"{TP3_COMMENT} level invalid: entry_third={entry_third_norm}, sl_actual={sl_actual}"
+                    )
 
 
         # Minimum distance validation.
@@ -550,9 +563,19 @@ def check_orders(
                 ("entry1-sl", _dist(entry_first_norm, sl_actual), minimum_distance_norm),
                 ("entry2-sl", _dist(entry_second_norm, sl_actual), minimum_distance_norm),
                 ("entry3-sl", _dist(entry_third_norm, sl_actual), minimum_distance_norm),
-                ("entry1-tp1", _dist(entry_first_norm, tp1), minimum_distance_norm),
-                ("entry2-tp2", _dist(entry_second_norm, tp2), minimum_distance_norm),
             ]
+            if tp1 is not None:
+                level_checks.append(
+                    ("entry1-tp1", _dist(entry_first_norm, tp1), minimum_distance_norm)
+                )
+            if tp2 is not None:
+                level_checks.append(
+                    ("entry2-tp2", _dist(entry_second_norm, tp2), minimum_distance_norm)
+                )
+            if tp3 is not None:
+                level_checks.append(
+                    ("entry3-tp3", _dist(entry_third_norm, tp3), minimum_distance_norm)
+                )
 
             for label, actual, minimum in level_checks:
                 if actual < minimum:
@@ -567,7 +590,7 @@ def check_orders(
         orders = (
             ("TG-TP1", entry_first_norm, tp1, order_type_tp1),
             ("TG-TP2", entry_second_norm, tp2, order_type_tp2),
-            (TP3_COMMENT, entry_third_norm, None, order_type_tp3),
+            (TP3_COMMENT, entry_third_norm, tp3, order_type_tp3),
         )
 
         for order_idx, (comment, price_level, tp_level, pending_type) in enumerate(orders):
