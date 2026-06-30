@@ -284,7 +284,10 @@ def parse_signal(text: str) -> dict | None:
     token_a = range_match.group("price_a")
     token_b = range_match.group("price_b")
     signal_style = _detect_signal_style(text)
-    chat_tp_pips = _parse_chat_tp_pips(text)
+    if signal_style in ("intraday", "swing"):
+        chat_tp_pips = _parse_chat_tp_pips(text)
+    else:
+        chat_tp_pips = [None, None, None]
 
     return {
         "direction": _normalize_direction(direction_match.group("direction")),
