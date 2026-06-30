@@ -1007,6 +1007,14 @@ async function botRestart() {
             '</div>'
         )
 
+    def val(key: str, default: str = "") -> str:
+        raw_value = raw_cfg.get(key, default) if isinstance(raw_cfg, dict) else default
+        if raw_value is None:
+            return default
+        if isinstance(raw_value, bool):
+            return "true" if raw_value else "false"
+        return str(raw_value).strip()
+
     replacements = {
         "@@STATUS_LIGHT_BANNER@@": status_light_banner_html,
         "@@MSG_HTML@@": msg_html,
@@ -1015,12 +1023,9 @@ async function botRestart() {
         "@@SAFETY_STATUS@@": safety_status_html,
         "@@BOT_PROCESS_SECTION@@": bot_process_section_html,
         "@@LAYERS_SECTION@@": layers_html,
-    
-    # also support legacy placeholder location (inside static template)
-
-
-
         "@@LOT@@": _html_escape(val("lot")),
+
+
         "@@PIP@@": _html_escape(val("pip")),
         "@@TP1_PIPS@@": _html_escape(val("tp1_pips")),
         "@@TP2_PIPS@@": _html_escape(val("tp2_pips")),
