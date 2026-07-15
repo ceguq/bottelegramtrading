@@ -70,11 +70,20 @@ def _event_message_id(event):
     return message_id
 
 
-def _normalize_layer_override_list(values, pad_value, size=3):
+MAX_RUNTIME_LAYERS = 10
+
+
+def _normalize_layer_override_list(values, pad_value, size=None):
     if values is None:
         return None
-    normalized = list(values[:size])
-    if len(normalized) < size:
+    normalized = list(values)
+    if len(normalized) > MAX_RUNTIME_LAYERS:
+        raise ValueError(
+            f"too_many_enabled_layers: maximum {MAX_RUNTIME_LAYERS}, got {len(normalized)}"
+        )
+    if size is not None and len(normalized) > size:
+        raise ValueError(f"Layer override list has more items than configured layers: {values}")
+    if size is not None and len(normalized) < size:
         normalized.extend([pad_value] * (size - len(normalized)))
     return normalized
 
@@ -739,6 +748,8 @@ async def handle_signal(event):
     tp_mode_overrides = None
     order_entries = None
     order_comments = None
+    configured_layers_count = 0
+    enabled_layers_count = 0
     try:
         layers = load_runtime_layers()
         if layers is None:
@@ -755,6 +766,18 @@ async def handle_signal(event):
             _entry_diag("final placed_count=0 reason=no_enabled_layers_configured")
             return
         else:
+            configured_layers_count = len(layers)
+            if configured_layers_count > MAX_RUNTIME_LAYERS:
+                logger.info(
+                    "too_many_enabled_layers; configured_layers_count=%s max=%s",
+                    configured_layers_count,
+                    MAX_RUNTIME_LAYERS,
+                )
+                print("Too many enabled layers configured; signal skipped")
+                _entry_diag("active order blocker no reason=too_many_enabled_layers")
+                _entry_diag("final placed_count=0 reason=too_many_enabled_layers")
+                return
+
             # Non-empty list: map every configured layer to one order.
             lot_overrides = []
             order_enabled = []
@@ -771,12 +794,7 @@ async def handle_signal(event):
                 layer_enabled = bool(layer.get("enabled", False))
                 layer_lot = layer.get("lot")
                 layer_name = layer.get("name", f"L{layer_num}")
-                fixed_comments = ["TG-TP1", "TG-TP2", "TG-NO-TP"]
-                layer_comment = (
-                    fixed_comments[order_idx]
-                    if order_idx < len(fixed_comments)
-                    else (layer.get("comment") or f"TG-L{layer_num}")
-                )
+                layer_comment = layer.get("comment") or f"TG-L{layer_num}"
                 entry_percent = layer.get("entry_percent")
 
                 # Per-layer TP overrides
@@ -837,6 +855,17 @@ async def handle_signal(event):
                 _entry_diag("active order blocker no reason=no_enabled_layers_configured")
                 _entry_diag("final placed_count=0 reason=no_enabled_layers_configured")
                 return
+            enabled_layers_count = sum(1 for enabled in order_enabled if enabled is True)
+            logger.info(
+                "configured_layers_count=%s enabled_layers_count=%s",
+                configured_layers_count,
+                enabled_layers_count,
+            )
+            print(
+                "Layer count: "
+                f"configured_layers_count={configured_layers_count} "
+                f"enabled_layers_count={enabled_layers_count}"
+            )
 
     except Exception as exc:
         # Exception loading layers: skip signal (fail-safe)
@@ -920,7 +949,11 @@ async def handle_signal(event):
             _entry_diag(f"first-entry TP mapping {first_entry_tp_log}")
 
     if tp_source == "chat_message":
-        order_count = len(order_entries) if order_entries is not None else 3
+        order_count = (
+            len(order_entries)
+            if order_entries is not None
+            else configured_layers_count
+        )
         if tp_enabled_overrides is None:
             tp_enabled_overrides = [None] * order_count
         if tp_pips_overrides is None:
@@ -966,13 +999,57 @@ async def handle_signal(event):
     else:
         logger.info("Effective TP source remains layer_config")
 
-    lot_overrides = _normalize_layer_override_list(lot_overrides, None)
-    order_enabled = _normalize_layer_override_list(order_enabled, False)
-    tp_enabled_overrides = _normalize_layer_override_list(tp_enabled_overrides, None)
-    tp_pips_overrides = _normalize_layer_override_list(tp_pips_overrides, None)
-    tp_price_overrides = _normalize_layer_override_list(tp_price_overrides, None)
-    order_entries = _normalize_layer_override_list(order_entries, None)
-    order_comments = _normalize_layer_override_list(order_comments, None)
+    lot_overrides = _normalize_layer_override_list(
+        lot_overrides, None, configured_layers_count
+    )
+    order_enabled = _normalize_layer_override_list(
+        order_enabled, False, configured_layers_count
+    )
+    tp_enabled_overrides = _normalize_layer_override_list(
+        tp_enabled_overrides, None, configured_layers_count
+    )
+    tp_pips_overrides = _normalize_layer_override_list(
+        tp_pips_overrides, None, configured_layers_count
+    )
+    tp_price_overrides = _normalize_layer_override_list(
+        tp_price_overrides, None, configured_layers_count
+    )
+    order_entries = _normalize_layer_override_list(
+        order_entries, None, configured_layers_count
+    )
+    order_comments = _normalize_layer_override_list(
+        order_comments, None, configured_layers_count
+    )
+
+    for order_idx in range(configured_layers_count):
+        tp_enabled = (
+            tp_enabled_overrides[order_idx]
+            if isinstance(tp_enabled_overrides, list)
+            else None
+        )
+        if tp_enabled is False:
+            effective_tp_source = "disabled"
+            effective_tp = None
+        elif isinstance(tp_price_overrides, list) and tp_price_overrides[order_idx] is not None:
+            effective_tp_source = "price_override"
+            effective_tp = tp_price_overrides[order_idx]
+        elif isinstance(tp_pips_overrides, list) and tp_pips_overrides[order_idx] is not None:
+            effective_tp_source = "pips"
+            effective_tp = tp_pips_overrides[order_idx]
+        else:
+            effective_tp_source = "none"
+            effective_tp = None
+
+        layer_diag = (
+            f"L{order_idx + 1} enabled={order_enabled[order_idx]} "
+            f"lot={lot_overrides[order_idx]} "
+            f"entry_percent={entry_percent_overrides[order_idx] if isinstance(entry_percent_overrides, list) else None} "
+            f"entry_price={order_entries[order_idx]} "
+            f"tp_source={effective_tp_source} tp={effective_tp} "
+            f"comment={order_comments[order_idx]}"
+        )
+        logger.info("Layer runtime plan: %s", layer_diag)
+        _entry_diag(f"layer runtime plan {layer_diag}")
 
     _entry_diag("active order blocker no reason=no_active_order_blocker_in_entry_flow")
 
@@ -1161,7 +1238,7 @@ async def handle_signal(event):
     expected_count = (
         sum(1 for enabled in order_enabled if enabled is True)
         if isinstance(order_enabled, list)
-        else 3
+        else 0
     )
     if placed_count == expected_count and expected_count > 0:
         final_reason = "all_orders_placed"

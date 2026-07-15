@@ -66,6 +66,7 @@ MT5_IPC_RETRIES = 3  # Number of retries when MT5 returns an IPC timeout
 MT5_IPC_RETRY_DELAY = 5  # Seconds to wait between IPC timeout retries
 SL_UPDATE_COMMENT = "TG-SL-UPDATE"
 TP3_COMMENT = "TG-NO-TP"
+MAX_RUNTIME_LAYERS = 10
 
 
 def _with_mt5_lock(func):
@@ -77,15 +78,176 @@ def _with_mt5_lock(func):
     return wrapper
 
 
-def _normalize_layer_override_list(name, values, pad_value, size=3):
+def _default_layer_comment(index: int) -> str:
+    defaults = ("TG-TP1", "TG-TP2", TP3_COMMENT)
+    if index < len(defaults):
+        return defaults[index]
+    return f"TG-L{index + 1}"
+
+
+def _runtime_layer_count(*values, legacy_count=3) -> int:
+    lengths = [len(value) for value in values if value is not None]
+    layer_count = max(lengths) if lengths else legacy_count
+    if layer_count > MAX_RUNTIME_LAYERS:
+        raise ValueError(
+            f"too_many_enabled_layers: maximum {MAX_RUNTIME_LAYERS}, got {layer_count}"
+        )
+    return layer_count
+
+
+def _normalize_layer_override_list(name, values, pad_value, size=None):
     if values is None:
         return None
     if not isinstance(values, list):
         raise ValueError(f"{name} must be a list; got: {values}")
-    normalized = values[:size]
-    if len(normalized) < size:
+    if len(values) > MAX_RUNTIME_LAYERS:
+        raise ValueError(
+            f"too_many_enabled_layers: maximum {MAX_RUNTIME_LAYERS}, got {len(values)}"
+        )
+    normalized = list(values)
+    if size is not None and len(normalized) > size:
+        raise ValueError(f"{name} has more items than configured layers: {values}")
+    if size is not None and len(normalized) < size:
         normalized.extend([pad_value] * (size - len(normalized)))
     return normalized
+
+
+def _legacy_entry_values(entry_first, entry_second, entry_third, layer_count):
+    third_entry = entry_third if entry_third is not None else entry_second
+    entries = [entry_first, entry_second, third_entry]
+    while len(entries) < layer_count:
+        entries.append(third_entry)
+    return entries[:layer_count]
+
+
+def _prepare_layer_plan(
+    *,
+    lot_override,
+    lot_overrides,
+    order_enabled,
+    tp_enabled_overrides,
+    tp_pips_overrides,
+    tp_price_overrides=None,
+    order_entries=None,
+    order_comments=None,
+):
+    layer_count = _runtime_layer_count(
+        lot_overrides,
+        order_enabled,
+        tp_enabled_overrides,
+        tp_pips_overrides,
+        tp_price_overrides,
+        order_entries,
+        order_comments,
+    )
+
+    lot_overrides = _normalize_layer_override_list(
+        "lot_overrides", lot_overrides, None, layer_count
+    )
+    order_enabled = _normalize_layer_override_list(
+        "order_enabled", order_enabled, False, layer_count
+    )
+    tp_enabled_overrides = _normalize_layer_override_list(
+        "tp_enabled_overrides", tp_enabled_overrides, None, layer_count
+    )
+    tp_pips_overrides = _normalize_layer_override_list(
+        "tp_pips_overrides", tp_pips_overrides, None, layer_count
+    )
+    tp_price_overrides = _normalize_layer_override_list(
+        "tp_price_overrides", tp_price_overrides, None, layer_count
+    )
+    order_entries = _normalize_layer_override_list(
+        "order_entries", order_entries, None, layer_count
+    )
+    order_comments = _normalize_layer_override_list(
+        "order_comments", order_comments, None, layer_count
+    )
+
+    if order_enabled is not None:
+        enabled_list = order_enabled
+    else:
+        enabled_list = [True] * layer_count
+
+    enabled_count = sum(1 for enabled in enabled_list if enabled is True)
+    if enabled_count > MAX_RUNTIME_LAYERS:
+        raise ValueError(
+            f"too_many_enabled_layers: maximum {MAX_RUNTIME_LAYERS}, got {enabled_count}"
+        )
+
+    if lot_overrides is not None:
+        effective_lots = [LOT if lot is None else float(lot) for lot in lot_overrides]
+    elif lot_override is not None:
+        effective_lot = float(lot_override)
+        if not (effective_lot > 0):
+            raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
+        effective_lots = [effective_lot] * layer_count
+    else:
+        effective_lots = [LOT] * layer_count
+
+    for i, lot in enumerate(effective_lots):
+        if not (lot > 0):
+            raise ValueError(f"effective_lots[{i}] must be > 0; got: {lot}")
+
+    legacy_tp_enabled = [True, True, False]
+    legacy_tp_pips = [TP1_PIPS, TP2_PIPS, None]
+    tp_enabled_list = []
+    tp_pips_list = []
+
+    for i in range(layer_count):
+        raw_enabled = tp_enabled_overrides[i] if tp_enabled_overrides is not None else None
+        raw_pips = tp_pips_overrides[i] if tp_pips_overrides is not None else None
+
+        if raw_enabled is None:
+            tp_enabled_list.append(legacy_tp_enabled[i] if i < len(legacy_tp_enabled) else False)
+            tp_pips_list.append(legacy_tp_pips[i] if i < len(legacy_tp_pips) else None)
+        elif raw_enabled is True:
+            tp_enabled_list.append(True)
+            tp_pips_list.append(raw_pips)
+        elif raw_enabled is False:
+            tp_enabled_list.append(False)
+            tp_pips_list.append(None)
+        else:
+            raise ValueError(
+                f"tp_enabled_overrides[{i}] must be True, False, or None; got: {raw_enabled}"
+            )
+
+    for i in range(layer_count):
+        if enabled_list[i] is not True or tp_enabled_list[i] is not True:
+            continue
+        price_override = tp_price_overrides[i] if tp_price_overrides is not None else None
+        if price_override is not None:
+            price_num = float(price_override)
+            if price_num <= 0:
+                raise ValueError(f"tp_price_overrides[{i}] must be > 0; got: {price_num}")
+            continue
+        pips = tp_pips_list[i]
+        if pips is None:
+            raise ValueError(
+                f"tp_pips_list[{i}] must not be None when tp_enabled is True"
+            )
+        pips_num = float(pips)
+        if pips_num <= 0:
+            raise ValueError(f"tp_pips_list[{i}] must be > 0; got: {pips_num}")
+
+    comments = [
+        str(order_comments[i]) if order_comments is not None and order_comments[i] is not None
+        else _default_layer_comment(i)
+        for i in range(layer_count)
+    ]
+
+    return {
+        "layer_count": layer_count,
+        "configured_layers_count": layer_count,
+        "enabled_layers_count": enabled_count,
+        "lot_overrides": lot_overrides,
+        "enabled_list": enabled_list,
+        "effective_lots": effective_lots,
+        "tp_enabled_list": tp_enabled_list,
+        "tp_pips_list": tp_pips_list,
+        "tp_price_overrides": tp_price_overrides,
+        "order_entries": order_entries,
+        "comments": comments,
+    }
 
 
 def _is_ipc_timeout(error):
@@ -266,98 +428,37 @@ def check_orders(
     order_enabled: list[bool] | None = None,
     tp_enabled_overrides: list[bool | None] | None = None,
     tp_pips_overrides: list[float | None] | None = None,
+    entry_third: float | None = None,
+    tp_price_overrides: list[float | None] | None = None,
+    order_entries: list[float | None] | None = None,
+    order_comments: list[str | None] | None = None,
 ) -> dict:
-    lot_overrides = _normalize_layer_override_list("lot_overrides", lot_overrides, None)
-    order_enabled = _normalize_layer_override_list("order_enabled", order_enabled, False)
-    tp_enabled_overrides = _normalize_layer_override_list(
-        "tp_enabled_overrides", tp_enabled_overrides, None
+    plan = _prepare_layer_plan(
+        lot_override=lot_override,
+        lot_overrides=lot_overrides,
+        order_enabled=order_enabled,
+        tp_enabled_overrides=tp_enabled_overrides,
+        tp_pips_overrides=tp_pips_overrides,
+        tp_price_overrides=tp_price_overrides,
+        order_entries=order_entries,
+        order_comments=order_comments,
     )
-    tp_pips_overrides = _normalize_layer_override_list(
-        "tp_pips_overrides", tp_pips_overrides, None
-    )
 
-    # Resolve effective lots with backward compatibility
-    if lot_overrides is not None:
-        # Per-order lots from layer mapping
-        if not isinstance(lot_overrides, list) or len(lot_overrides) != 3:
-            raise ValueError(f"lot_overrides must be a list of 3 items; got: {lot_overrides}")
-        effective_lots = [LOT if x is None else float(x) for x in lot_overrides]
-    elif lot_override is not None:
-        # Legacy scalar lot_override: apply to all 3 orders
-        effective_lot = float(lot_override)
-        if not (effective_lot > 0):
-            raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
-        effective_lots = [effective_lot, effective_lot, effective_lot]
-    else:
-        # No override: use default LOT for all 3 orders
-        effective_lots = [LOT, LOT, LOT]
-    
-    # Validate all lots > 0
-    for i, lot in enumerate(effective_lots):
-        if not (lot > 0):
-            raise ValueError(f"effective_lots[{i}] must be > 0; got: {lot}")
-
-    # Resolve order enabled status
-    if order_enabled is not None:
-        if not isinstance(order_enabled, list) or len(order_enabled) != 3:
-            raise ValueError(f"order_enabled must be a list of 3 items; got: {order_enabled}")
-        enabled_list = order_enabled
-    else:
-        enabled_list = [True, True, True]
-
-    
-    
-    # Resolve TP enabled/pips with fallback for missing layers
-    legacy_tp_enabled = [True, True, False]
-    legacy_tp_pips = [TP1_PIPS, TP2_PIPS, None]
-    tp_enabled_list = [None, None, None]
-    tp_pips_list = [None, None, None]
-    
-    # Validate override lists if provided
-    if tp_enabled_overrides is not None:
-        if not isinstance(tp_enabled_overrides, list) or len(tp_enabled_overrides) != 3:
-            raise ValueError(f"tp_enabled_overrides must be a list of 3 items; got: {tp_enabled_overrides}")
-    if tp_pips_overrides is not None:
-        if not isinstance(tp_pips_overrides, list) or len(tp_pips_overrides) != 3:
-            raise ValueError(f"tp_pips_overrides must be a list of 3 items; got: {tp_pips_overrides}")
-    
-    # Merge overrides with legacy defaults per index
-    for i in range(3):
-        raw_enabled = tp_enabled_overrides[i] if tp_enabled_overrides is not None else None
-        raw_pips = tp_pips_overrides[i] if tp_pips_overrides is not None else None
-        
-        if raw_enabled is None:
-            # Missing layer: use legacy TP behavior for this order
-            tp_enabled_list[i] = legacy_tp_enabled[i]
-            tp_pips_list[i] = legacy_tp_pips[i]
-        elif raw_enabled is True:
-            # Explicitly enabled: use provided pips
-            tp_enabled_list[i] = True
-            tp_pips_list[i] = raw_pips
-        elif raw_enabled is False:
-            # Explicitly disabled: no TP for this order
-            tp_enabled_list[i] = False
-            tp_pips_list[i] = None
-        else:
-            raise ValueError(f"tp_enabled_overrides[{i}] must be True, False, or None; got: {raw_enabled}")
-    
-    # Validate: tp_pips must be > 0 when tp_enabled is True
-    for i in range(3):
-        if tp_enabled_list[i] is True:
-            pips = tp_pips_list[i]
-            if pips is None:
-                raise ValueError(f"tp_pips_list[{i}] must not be None when tp_enabled is True")
-            pips_num = float(pips)
-            if pips_num <= 0:
-                raise ValueError(f"tp_pips_list[{i}] must be > 0; got: {pips_num}")
-    
-    effective_lot = effective_lots[0]  # For result_data backward compat
+    layer_count = plan["layer_count"]
+    enabled_list = plan["enabled_list"]
+    effective_lots = plan["effective_lots"]
+    tp_enabled_list = plan["tp_enabled_list"]
+    tp_pips_list = plan["tp_pips_list"]
+    tp_price_overrides = plan["tp_price_overrides"]
+    order_entries = plan["order_entries"]
+    comments = plan["comments"]
+    effective_lot = effective_lots[0] if effective_lots else LOT
 
 
     # Compute per-order lot summary (disabled layers excluded)
     lots_per_order = effective_lots[:]  # effective lots always represent requested layer lots
     total_planned_lot = sum(
-        float(lots_per_order[i]) for i in range(3) if enabled_list[i] is True
+        float(lots_per_order[i]) for i in range(layer_count) if enabled_list[i] is True
     )
 
     result_data = {
@@ -368,15 +469,17 @@ def check_orders(
         "sl": None,
         "entry_first": entry_first,
         "entry_second": entry_second,
-        "entry_third": entry_second,
+        "entry_third": entry_third if entry_third is not None else entry_second,
         "current_bid": None,
         "current_ask": None,
         "volume": effective_lot,
-        "total_volume": effective_lot * 3,
+        "total_volume": total_planned_lot,
         # New summary fields (used by TEST MODE console)
         "lots_per_order": lots_per_order,
         "enabled_orders": enabled_list,
         "total_planned_lot": total_planned_lot,
+        "configured_layers_count": plan["configured_layers_count"],
+        "enabled_layers_count": plan["enabled_layers_count"],
         "broker": None,
         "orders": [],
         "error": None,
@@ -386,6 +489,12 @@ def check_orders(
         result_data["error"] = "no_enabled_layers_configured"
         logger.info("no_enabled_layers_configured; skipping order check")
         return result_data
+
+    logger.info(
+        "configured_layers_count=%s enabled_layers_count=%s",
+        plan["configured_layers_count"],
+        plan["enabled_layers_count"],
+    )
 
     try:
         if connect() is not True:
@@ -431,58 +540,40 @@ def check_orders(
             "volume_step": volume_step,
         }
 
-        # Validate LOT against broker rules.
-        if volume_min is not None and LOT < volume_min:
-            result_data["error"] = f"Invalid LOT={LOT}; volume_min={volume_min}"
-            return result_data
-        if volume_max is not None and LOT > volume_max:
-            result_data["error"] = f"Invalid LOT={LOT}; volume_max={volume_max}"
-            return result_data
-        if volume_step is not None and volume_step > 0:
-            steps = (LOT - (volume_min if volume_min is not None else 0.0)) / volume_step
-            if abs(round(steps) - steps) > 1e-6:
-                result_data["error"] = (
-                    f"Invalid LOT={LOT}; volume_step={volume_step}"
-                    + (f", volume_min={volume_min}" if volume_min is not None else "")
-                    + (f", volume_max={volume_max}" if volume_max is not None else "")
-                )
+        # Validate layer lots against broker rules.
+        for order_idx, lot in enumerate(effective_lots):
+            if enabled_list[order_idx] is not True:
+                continue
+            if volume_min is not None and lot < volume_min:
+                result_data["error"] = f"Invalid lot L{order_idx + 1}={lot}; volume_min={volume_min}"
                 return result_data
-
-        entry_first_norm = _normalize_price(entry_first, digits)
-        entry_second_norm = _normalize_price(entry_second, digits)
-        entry_third_norm = entry_second_norm
-        sl_raw_norm = _normalize_price(sl_raw, digits)
-
-        sl_actual = sl_raw_norm
-
-        # Calculate per-order TP values using tp_enabled_list and tp_pips_list
-        tp_levels = []
-        entries = [entry_first_norm, entry_second_norm, entry_third_norm]
-        
-        for order_idx in range(3):
-            if tp_enabled_list[order_idx] is False:
-                # TP disabled for this order
-                tp_levels.append(None)
-            else:
-                # TP enabled: calculate using tp_pips
-                pips = tp_pips_list[order_idx]
-                if pips is None:
-                    tp_levels.append(None)
-                else:
-                    pips_num = float(pips)
-                    tp_val = (
-                        _normalize_price(entries[order_idx] - pips_num * PIP, digits)
-                        if direction_lower == "sell"
-                        else _normalize_price(entries[order_idx] + pips_num * PIP, digits)
+            if volume_max is not None and lot > volume_max:
+                result_data["error"] = f"Invalid lot L{order_idx + 1}={lot}; volume_max={volume_max}"
+                return result_data
+            if volume_step is not None and volume_step > 0:
+                steps = (lot - (volume_min if volume_min is not None else 0.0)) / volume_step
+                if abs(round(steps) - steps) > 1e-6:
+                    result_data["error"] = (
+                        f"Invalid lot L{order_idx + 1}={lot}; volume_step={volume_step}"
+                        + (f", volume_min={volume_min}" if volume_min is not None else "")
+                        + (f", volume_max={volume_max}" if volume_max is not None else "")
                     )
-                    tp_levels.append(tp_val)
-        
-        # Legacy variable names for validation compatibility
-        tp1 = tp_levels[0]
-        tp2 = tp_levels[1]
-        tp3 = tp_levels[2]
-        
+                    return result_data
+
+        legacy_entries = _legacy_entry_values(entry_first, entry_second, entry_third, layer_count)
+        entries = [
+            _normalize_price(
+                order_entries[i] if order_entries is not None and order_entries[i] is not None else legacy_entries[i],
+                digits,
+            )
+            for i in range(layer_count)
+        ]
+        sl_actual = _normalize_price(sl_raw, digits)
         result_data["sl"] = sl_actual
+        result_data["entry"] = entries[0] if entries else entry_first
+        result_data["entry_first"] = entries[0] if len(entries) > 0 else None
+        result_data["entry_second"] = entries[1] if len(entries) > 1 else result_data["entry_first"]
+        result_data["entry_third"] = entries[2] if len(entries) > 2 else result_data["entry_second"]
 
         current_price = (
             getattr(tick, "bid", None) if direction_lower == "sell" else getattr(tick, "ask", None)
@@ -492,84 +583,55 @@ def check_orders(
             result_data["error"] = f"Could not determine current price: {mt5.last_error()}"
             return result_data
 
-        order_type_tp1 = _order_type(direction_lower, entry_first_norm, current_price)
-        order_type_tp2 = _order_type(direction_lower, entry_second_norm, current_price)
-        order_type_tp3 = _order_type(direction_lower, entry_third_norm, current_price)
+        tp_levels = []
+        tp_sources = []
+        for order_idx, entry_value in enumerate(entries):
+            if tp_enabled_list[order_idx] is False:
+                tp_levels.append(None)
+                tp_sources.append("disabled")
+            elif tp_price_overrides is not None and tp_price_overrides[order_idx] is not None:
+                tp_val = _normalize_price(float(tp_price_overrides[order_idx]), digits)
+                tp_levels.append(tp_val)
+                tp_sources.append("price_override")
+            else:
+                pips = tp_pips_list[order_idx]
+                if pips is None:
+                    tp_levels.append(None)
+                    tp_sources.append("none")
+                else:
+                    pips_num = float(pips)
+                    tp_val = (
+                        _normalize_price(entry_value - pips_num * PIP, digits)
+                        if direction_lower == "sell"
+                        else _normalize_price(entry_value + pips_num * PIP, digits)
+                    )
+                    tp_levels.append(tp_val)
+                    tp_sources.append("pips")
 
-
-        # Validate SL/TP orientation per-order entry.
         errors = []
-        if direction_lower == "buy":
-            # BUY: SL < entries; TP layers must have entry < TP if TP exists.
-            if tp1 is not None:
-                if not (sl_actual < entry_first_norm < tp1):
+        for order_idx, (entry_value, tp_level) in enumerate(zip(entries, tp_levels)):
+            if enabled_list[order_idx] is not True:
+                continue
+            comment = comments[order_idx]
+            if direction_lower == "buy":
+                if tp_level is not None and not (sl_actual < entry_value < tp_level):
                     errors.append(
-                        f"TG-TP1 level invalid: sl_actual={sl_actual}, entry_first={entry_first_norm}, tp1={tp1}"
+                        f"{comment} level invalid: sl_actual={sl_actual}, entry={entry_value}, tp={tp_level}"
+                    )
+                elif tp_level is None and not (sl_actual < entry_value):
+                    errors.append(
+                        f"{comment} level invalid: sl_actual={sl_actual}, entry={entry_value}"
                     )
             else:
-                if not (sl_actual < entry_first_norm):
+                if tp_level is not None and not (tp_level < entry_value < sl_actual):
                     errors.append(
-                        f"TG-TP1 level invalid: sl_actual={sl_actual}, entry_first={entry_first_norm}"
+                        f"{comment} level invalid: tp={tp_level}, entry={entry_value}, sl_actual={sl_actual}"
                     )
-            
-            if tp2 is not None:
-                if not (sl_actual < entry_second_norm < tp2):
+                elif tp_level is None and not (entry_value < sl_actual):
                     errors.append(
-                        f"TG-TP2 level invalid: sl_actual={sl_actual}, entry_second={entry_second_norm}, tp2={tp2}"
-                    )
-            else:
-                if not (sl_actual < entry_second_norm):
-                    errors.append(
-                        f"TG-TP2 level invalid: sl_actual={sl_actual}, entry_second={entry_second_norm}"
-                    )
-            
-            if tp3 is not None:
-                if not (sl_actual < entry_third_norm < tp3):
-                    errors.append(
-                        f"{TP3_COMMENT} level invalid: sl_actual={sl_actual}, entry_third={entry_third_norm}, tp3={tp3}"
-                    )
-            else:
-                if not (sl_actual < entry_third_norm):
-                    errors.append(
-                        f"{TP3_COMMENT} level invalid: sl_actual={sl_actual}, entry_third={entry_third_norm}"
-                    )
-        else:
-            # SELL: TP < entry if TP exists; no-TP layer only needs entry < SL.
-            if tp1 is not None:
-                if not (tp1 < entry_first_norm < sl_actual):
-                    errors.append(
-                        f"TG-TP1 level invalid: tp1={tp1}, entry_first={entry_first_norm}, sl_actual={sl_actual}"
-                    )
-            else:
-                if not (entry_first_norm < sl_actual):
-                    errors.append(
-                        f"TG-TP1 level invalid: entry_first={entry_first_norm}, sl_actual={sl_actual}"
-                    )
-            
-            if tp2 is not None:
-                if not (tp2 < entry_second_norm < sl_actual):
-                    errors.append(
-                        f"TG-TP2 level invalid: tp2={tp2}, entry_second={entry_second_norm}, sl_actual={sl_actual}"
-                    )
-            else:
-                if not (entry_second_norm < sl_actual):
-                    errors.append(
-                        f"TG-TP2 level invalid: entry_second={entry_second_norm}, sl_actual={sl_actual}"
-                    )
-            
-            if tp3 is not None:
-                if not (tp3 < entry_third_norm < sl_actual):
-                    errors.append(
-                        f"{TP3_COMMENT} level invalid: tp3={tp3}, entry_third={entry_third_norm}, sl_actual={sl_actual}"
-                    )
-            else:
-                if not (entry_third_norm < sl_actual):
-                    errors.append(
-                        f"{TP3_COMMENT} level invalid: entry_third={entry_third_norm}, sl_actual={sl_actual}"
+                        f"{comment} level invalid: entry={entry_value}, sl_actual={sl_actual}"
                     )
 
-
-        # Minimum distance validation.
         if trade_stops_level is not None and point is not None and trade_stops_level > 0:
             minimum_distance = trade_stops_level * point
             minimum_distance_norm = _normalize_price(minimum_distance, digits)
@@ -577,44 +639,39 @@ def check_orders(
             def _dist(a, b):
                 return abs(a - b)
 
-            level_checks = [
-                ("entry1-current_price", _dist(entry_first_norm, current_price), minimum_distance_norm),
-                ("entry2-current_price", _dist(entry_second_norm, current_price), minimum_distance_norm),
-                ("entry3-current_price", _dist(entry_third_norm, current_price), minimum_distance_norm),
-                ("entry1-sl", _dist(entry_first_norm, sl_actual), minimum_distance_norm),
-                ("entry2-sl", _dist(entry_second_norm, sl_actual), minimum_distance_norm),
-                ("entry3-sl", _dist(entry_third_norm, sl_actual), minimum_distance_norm),
-            ]
-            if tp1 is not None:
-                level_checks.append(
-                    ("entry1-tp1", _dist(entry_first_norm, tp1), minimum_distance_norm)
-                )
-            if tp2 is not None:
-                level_checks.append(
-                    ("entry2-tp2", _dist(entry_second_norm, tp2), minimum_distance_norm)
-                )
-            if tp3 is not None:
-                level_checks.append(
-                    ("entry3-tp3", _dist(entry_third_norm, tp3), minimum_distance_norm)
-                )
-
-            for label, actual, minimum in level_checks:
-                if actual < minimum:
-                    result_data["error"] = f"{label} too close: actual={actual}, minimum={minimum}"
-                    return result_data
+            for order_idx, entry_value in enumerate(entries):
+                if enabled_list[order_idx] is not True:
+                    continue
+                layer_num = order_idx + 1
+                level_checks = [
+                    (f"entry{layer_num}-current_price", _dist(entry_value, current_price), minimum_distance_norm),
+                    (f"entry{layer_num}-sl", _dist(entry_value, sl_actual), minimum_distance_norm),
+                ]
+                if tp_levels[order_idx] is not None:
+                    level_checks.append(
+                        (f"entry{layer_num}-tp{layer_num}", _dist(entry_value, tp_levels[order_idx]), minimum_distance_norm)
+                    )
+                for label, actual, minimum in level_checks:
+                    if actual < minimum:
+                        result_data["error"] = f"{label} too close: actual={actual}, minimum={minimum}"
+                        return result_data
 
         if errors:
             result_data["error"] = "; ".join(errors)
             return result_data
 
+        orders = [
+            (
+                comments[order_idx],
+                entries[order_idx],
+                tp_levels[order_idx],
+                _order_type(direction_lower, entries[order_idx], current_price),
+                tp_sources[order_idx],
+            )
+            for order_idx in range(layer_count)
+        ]
 
-        orders = (
-            ("TG-TP1", entry_first_norm, tp1, order_type_tp1),
-            ("TG-TP2", entry_second_norm, tp2, order_type_tp2),
-            (TP3_COMMENT, entry_third_norm, tp3, order_type_tp3),
-        )
-
-        for order_idx, (comment, price_level, tp_level, pending_type) in enumerate(orders):
+        for order_idx, (comment, price_level, tp_level, pending_type, tp_source) in enumerate(orders):
             # Skip disabled orders
             if not enabled_list[order_idx]:
                 # Log skipped order
@@ -624,6 +681,7 @@ def check_orders(
                     "checked": False,
                     "skipped": True,
                     "reason": "order disabled by layer config",
+                    "tp_source": tp_source,
                     "request": None,
                     "retcode": None,
                     "comment_result": None,
@@ -674,6 +732,7 @@ def check_orders(
                     "request": request,
                     "checked": True,
                     "ok": False,
+                    "tp_source": tp_source,
                     "retcode": retcode_result,
                     "comment": comment_result,
                     "error": err_msg,
@@ -690,6 +749,7 @@ def check_orders(
                 "request": request,
                 "checked": True,
                 "ok": ok,
+                "tp_source": tp_source,
                 "retcode": getattr(check_result, "retcode", None),
                 "comment": getattr(check_result, "comment", None),
                 "error": None,
@@ -1416,105 +1476,35 @@ def place_orders(
 
     Returns successful ticket numbers in order: [ticket_tp1, ticket_tp2, ticket_tp3].
     """
-    lot_overrides = _normalize_layer_override_list("lot_overrides", lot_overrides, None)
-    order_enabled = _normalize_layer_override_list("order_enabled", order_enabled, False)
-    tp_enabled_overrides = _normalize_layer_override_list(
-        "tp_enabled_overrides", tp_enabled_overrides, None
+    plan = _prepare_layer_plan(
+        lot_override=lot_override,
+        lot_overrides=lot_overrides,
+        order_enabled=order_enabled,
+        tp_enabled_overrides=tp_enabled_overrides,
+        tp_pips_overrides=tp_pips_overrides,
+        tp_price_overrides=tp_price_overrides,
+        order_entries=order_entries,
+        order_comments=order_comments,
     )
-    tp_pips_overrides = _normalize_layer_override_list(
-        "tp_pips_overrides", tp_pips_overrides, None
-    )
-    tp_price_overrides = _normalize_layer_override_list(
-        "tp_price_overrides", tp_price_overrides, None
-    )
-    order_entries = _normalize_layer_override_list("order_entries", order_entries, None)
-    order_comments = _normalize_layer_override_list("order_comments", order_comments, None)
 
-    # Resolve effective lots with backward compatibility
-    if lot_overrides is not None:
-        # Per-order lots from layer mapping
-        if not isinstance(lot_overrides, list) or len(lot_overrides) != 3:
-            raise ValueError(f"lot_overrides must be a list of 3 items; got: {lot_overrides}")
-        effective_lots = [LOT if x is None else float(x) for x in lot_overrides]
-    elif lot_override is not None:
-        # Legacy scalar lot_override: apply to all 3 orders
-        effective_lot = float(lot_override)
-        if not (effective_lot > 0):
-            raise ValueError(f"lot_override must be > 0; got: {effective_lot}")
-        effective_lots = [effective_lot, effective_lot, effective_lot]
-    else:
-        # No override: use default LOT for all 3 orders
-        effective_lots = [LOT, LOT, LOT]
-    
-    # Validate all lots > 0
-    for i, lot in enumerate(effective_lots):
-        if not (lot > 0):
-            raise ValueError(f"effective_lots[{i}] must be > 0; got: {lot}")
-    
-    # Resolve order enabled status
-    if order_enabled is not None:
-        if not isinstance(order_enabled, list) or len(order_enabled) != 3:
-            raise ValueError(f"order_enabled must be a list of 3 items; got: {order_enabled}")
-        enabled_list = order_enabled
-    else:
-        # Default: all orders enabled
-        enabled_list = [True, True, True]
+    layer_count = plan["layer_count"]
+    enabled_list = plan["enabled_list"]
+    effective_lots = plan["effective_lots"]
+    tp_enabled_list = plan["tp_enabled_list"]
+    tp_pips_list = plan["tp_pips_list"]
+    tp_price_overrides = plan["tp_price_overrides"]
+    order_entries = plan["order_entries"]
+    comments = plan["comments"]
 
     if not any(enabled_list):
         logger.info("no_enabled_layers_configured; skipping order placement")
         return []
-    
-    # Resolve TP enabled/pips with fallback for missing layers
-    legacy_tp_enabled = [True, True, False]
-    legacy_tp_pips = [TP1_PIPS, TP2_PIPS, None]
-    tp_enabled_list = [None, None, None]
-    tp_pips_list = [None, None, None]
-    
-    # Validate override lists if provided
-    if tp_enabled_overrides is not None:
-        if not isinstance(tp_enabled_overrides, list) or len(tp_enabled_overrides) != 3:
-            raise ValueError(f"tp_enabled_overrides must be a list of 3 items; got: {tp_enabled_overrides}")
-    if tp_pips_overrides is not None:
-        if not isinstance(tp_pips_overrides, list) or len(tp_pips_overrides) != 3:
-            raise ValueError(f"tp_pips_overrides must be a list of 3 items; got: {tp_pips_overrides}")
-    
-    # Merge overrides with legacy defaults per index
-    for i in range(3):
-        raw_enabled = tp_enabled_overrides[i] if tp_enabled_overrides is not None else None
-        raw_pips = tp_pips_overrides[i] if tp_pips_overrides is not None else None
-        
-        if raw_enabled is None:
-            # Missing layer: use legacy TP behavior for this order
-            tp_enabled_list[i] = legacy_tp_enabled[i]
-            tp_pips_list[i] = legacy_tp_pips[i]
-        elif raw_enabled is True:
-            # Explicitly enabled: use provided pips
-            tp_enabled_list[i] = True
-            tp_pips_list[i] = raw_pips
-        elif raw_enabled is False:
-            # Explicitly disabled: no TP for this order
-            tp_enabled_list[i] = False
-            tp_pips_list[i] = None
-        else:
-            raise ValueError(f"tp_enabled_overrides[{i}] must be True, False, or None; got: {raw_enabled}")
-    
-    # Validate: tp_pips must be > 0 when tp_enabled is True
-    for i in range(3):
-        if tp_enabled_list[i] is True:
-            price_override = tp_price_overrides[i] if tp_price_overrides is not None else None
-            if price_override is not None:
-                price_num = float(price_override)
-                if price_num <= 0:
-                    raise ValueError(f"tp_price_overrides[{i}] must be > 0; got: {price_num}")
-                continue
-            pips = tp_pips_list[i]
-            if pips is None:
-                raise ValueError(
-                    f"tp_pips_list[{i}] must not be None when tp_enabled is True"
-                )
-            pips_num = float(pips)
-            if pips_num <= 0:
-                raise ValueError(f"tp_pips_list[{i}] must be > 0; got: {pips_num}")
+
+    logger.info(
+        "configured_layers_count=%s enabled_layers_count=%s",
+        plan["configured_layers_count"],
+        plan["enabled_layers_count"],
+    )
 
     tickets = []
 
@@ -1537,65 +1527,64 @@ def place_orders(
             raise RuntimeError(f"Could not read tick for {SYMBOL}: {mt5.last_error()}")
 
         digits = symbol_info.digits
-        entry_first = _normalize_price(entry_first, digits)
-        entry_second = _normalize_price(entry_second, digits)
-        entry_third = entry_second
-        sl_raw = _normalize_price(sl_raw, digits)
-        sl_actual, _, _ = _build_levels(direction, entry_first, entry_second, sl_raw, digits)
-        
-        # Calculate per-order TP values using tp_enabled_list and tp_pips_list
-        tp_levels = []
-        entries = [entry_first, entry_second, entry_third]
         direction_lower = direction.lower()
+        legacy_entries = _legacy_entry_values(entry_first, entry_second, entry_third, layer_count)
+        entries = [
+            _normalize_price(
+                order_entries[i] if order_entries is not None and order_entries[i] is not None else legacy_entries[i],
+                digits,
+            )
+            for i in range(layer_count)
+        ]
+        sl_actual = _normalize_price(sl_raw, digits)
         
-        for order_idx in range(3):
+        tp_levels = []
+        tp_sources = []
+        for order_idx, entry_value in enumerate(entries):
             if tp_enabled_list[order_idx] is False:
-                # TP disabled for this order
                 tp_levels.append(None)
-                logger.info("Layer %s effective TP source: tp_source=disabled", order_idx + 1)
+                tp_sources.append("disabled")
             elif tp_price_overrides is not None and tp_price_overrides[order_idx] is not None:
                 tp_val = _normalize_price(float(tp_price_overrides[order_idx]), digits)
                 tp_levels.append(tp_val)
-                logger.info(
-                    "Layer %s effective TP source: tp_source=price_override tp=%s",
-                    order_idx + 1,
-                    tp_val,
-                )
+                tp_sources.append("price_override")
             else:
-                # TP enabled: calculate using tp_pips
                 pips = tp_pips_list[order_idx]
                 if pips is None:
                     tp_levels.append(None)
-                    logger.info("Layer %s effective TP source: tp_source=none", order_idx + 1)
+                    tp_sources.append("none")
                 else:
                     pips_num = float(pips)
                     tp_val = (
-                        _normalize_price(entries[order_idx] - pips_num * PIP, digits)
+                        _normalize_price(entry_value - pips_num * PIP, digits)
                         if direction_lower == "sell"
-                        else _normalize_price(entries[order_idx] + pips_num * PIP, digits)
+                        else _normalize_price(entry_value + pips_num * PIP, digits)
                     )
                     tp_levels.append(tp_val)
-                    logger.info(
-                        "Layer %s effective TP source: tp_source=pips pips=%s tp=%s",
-                        order_idx + 1,
-                        pips_num,
-                        tp_val,
-                    )
-        
-        # Legacy variable names for compatibility
-        tp1 = tp_levels[0]
-        tp2 = tp_levels[1]
+                    tp_sources.append("pips")
+
+            logger.info(
+                "L%s enabled=%s lot=%s entry_price=%s tp_source=%s tp=%s comment=%s",
+                order_idx + 1,
+                enabled_list[order_idx],
+                effective_lots[order_idx],
+                entry_value,
+                tp_sources[order_idx],
+                tp_levels[order_idx],
+                comments[order_idx],
+            )
         
         current_price = tick.bid if direction == "sell" else tick.ask
-        order_type_tp1 = _order_type(direction, entry_first, current_price)
-        order_type_tp2 = _order_type(direction, entry_second, current_price)
-        order_type_tp3 = _order_type(direction, entry_third, current_price)
 
-        orders = (
-            ("TG-TP1", entry_first, tp_levels[0], order_type_tp1),
-            ("TG-TP2", entry_second, tp_levels[1], order_type_tp2),
-            (TP3_COMMENT, entry_third, tp_levels[2], order_type_tp3),
-        )
+        orders = [
+            (
+                comments[order_idx],
+                entries[order_idx],
+                tp_levels[order_idx],
+                _order_type(direction_lower, entries[order_idx], current_price),
+            )
+            for order_idx in range(layer_count)
+        ]
 
         for order_idx, (comment, order_entry, tp, order_type) in enumerate(orders):
             # Skip disabled orders
