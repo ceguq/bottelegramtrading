@@ -1,8 +1,8 @@
 r"""
 MT5 execution module for the XAUUSD Telegram signal bot.
 
-Fill in the MT5 account settings below. This module is called by
-telegram_listener.py to place three pending orders from one parsed signal.
+MT5 account settings are loaded from bot_config.json. This module is called by
+telegram_listener.py to place pending orders from one parsed signal.
 
 Valetax terminal path (required):
 If you have both MetaQuotes MT5 and the Valetax MT5 installed, you must
@@ -39,26 +39,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MT5_LOGIN = 2171043269  # real
-#MT5_LOGIN = 371863329  # demo
-
-MT5_PASSWORD = "sw34LOG2311@"  # Your MT5 account password
-
-MT5_SERVER = "ValetaxIntl-Live7"  # real
-#MT5_SERVER = "ValetaxIntl-Live2"  # demo
-
-# IMPORTANT: set to your Valetax terminal64.exe path.
-# This is a placeholder; update it to match your local installation.
-MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
-
 SYMBOL = "XAUUSD.vxc"  # Broker symbol to trade
 
-# Safe operational settings loaded from bot_config.json (via bot_settings.py).
-# Credentials and identifiers (MT5/Telegram) remain in code.
+# Operational and MT5 account settings loaded from bot_config.json (via bot_settings.py).
 try:
     from bot_settings import load_settings
 
     _settings = load_settings()
+    MT5_LOGIN = _settings.mt5_login
+    MT5_PASSWORD = _settings.mt5_password
+    MT5_SERVER = _settings.mt5_server
+    MT5_PATH = _settings.mt5_path
     LOT = _settings.lot  # Lot size for each pending order
     PIP = _settings.pip  # 1 pip = configured for XAUUSD
     TP1_PIPS = _settings.tp1_pips  # Pips for Order 1 take profit
@@ -99,7 +90,12 @@ def connect():
         return False
 
     for attempt in range(MT5_IPC_RETRIES + 1):
-        if not mt5.initialize(path=MT5_PATH):
+        if not mt5.initialize(
+            path=MT5_PATH,
+            login=MT5_LOGIN,
+            password=MT5_PASSWORD,
+            server=MT5_SERVER,
+        ):
             error = mt5.last_error()
             mt5.shutdown()
             if _is_ipc_timeout(error) and attempt < MT5_IPC_RETRIES:

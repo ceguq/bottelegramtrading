@@ -26,7 +26,17 @@ SAFE_KEYS = [
     "monitor_interval",
     "telegram_test_mode",
     "source_chat_id",
+    "source_chat_id_2",
+    "miss_entry_cancel_enabled",
+    "miss_entry_runaway_cancel_pips",
+    "near_entry_max_pips",
+    "mt5_login",
+    "mt5_password",
+    "mt5_server",
+    "mt5_path",
 ]
+
+SENSITIVE_CONFIG_KEYS = {"mt5_password"}
 
 
 def _safe_load_bot_config_json() -> dict:
@@ -38,8 +48,16 @@ def _safe_load_bot_config_json() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _safe_extract_allowed_keys(obj: dict) -> dict:
-    return {k: obj.get(k) for k in SAFE_KEYS if k in obj}
+def _safe_extract_allowed_keys(obj: dict, *, mask_sensitive: bool = True) -> dict:
+    extracted = {}
+    for key in SAFE_KEYS:
+        if key not in obj:
+            continue
+        value = obj.get(key)
+        if mask_sensitive and key in SENSITIVE_CONFIG_KEYS and value:
+            value = "<masked>"
+        extracted[key] = value
+    return extracted
 
 
 def _string_to_bool(value: str) -> bool:
@@ -71,10 +89,35 @@ def _parse_number(value, *, field_name: str, allow_zero: bool = False) -> float:
     return num
 
 
+def _parse_positive_int(value, *, field_name: str) -> int:
+    try:
+        if isinstance(value, bool):
+            raise TypeError
+        if isinstance(value, str):
+            value = value.strip()
+        parsed = int(value)
+    except Exception as e:
+        raise ValueError(f"{field_name} must be integer") from e
+
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+    return parsed
+
+
+def _parse_non_empty_text(value, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be text")
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    return value
+
+
 def _validate_and_build_settings_from_input(input_obj: dict) -> dict:
     """Validate Phase 3B fields and return a sanitized config (only SAFE_KEYS)."""
 
     errors = []
+    existing_cfg = _safe_load_bot_config_json()
 
     def get(k):
         return input_obj.get(k)
@@ -145,23 +188,111 @@ def _validate_and_build_settings_from_input(input_obj: dict) -> dict:
         errors.append(str(e))
         telegram_test_mode = None
 
+    # miss_entry_cancel_enabled: boolean
+    try:
+        miss_entry_cancel_enabled_val = get("miss_entry_cancel_enabled")
+        if isinstance(miss_entry_cancel_enabled_val, bool):
+            miss_entry_cancel_enabled = miss_entry_cancel_enabled_val
+        else:
+            miss_entry_cancel_enabled = _string_to_bool(str(miss_entry_cancel_enabled_val))
+    except ValueError as e:
+        errors.append(str(e).replace("telegram_test_mode", "miss_entry_cancel_enabled"))
+        miss_entry_cancel_enabled = None
+
+    # miss_entry_runaway_cancel_pips: numeric > 0
+    try:
+        miss_entry_runaway_cancel_pips = _parse_number(
+            get("miss_entry_runaway_cancel_pips"),
+            field_name="miss_entry_runaway_cancel_pips",
+            allow_zero=False,
+        )
+    except ValueError as e:
+        errors.append(str(e))
+        miss_entry_runaway_cancel_pips = None
+
+    # near_entry_max_pips: numeric >= 0
+    try:
+        near_entry_max_pips = _parse_number(
+            get("near_entry_max_pips"),
+            field_name="near_entry_max_pips",
+            allow_zero=True,
+        )
+    except ValueError as e:
+        errors.append(str(e))
+        near_entry_max_pips = None
+
     # source_chat_id: integer
     try:
+        from bot_settings import normalize_chat_id
+
         sid_val = get("source_chat_id")
-        if isinstance(sid_val, bool) or sid_val is None:
-            raise ValueError("source_chat_id must be integer")
-        if isinstance(sid_val, str):
-            sid = sid_val.strip()
-        else:
-            sid = str(sid_val)
-        source_chat_id = int(sid)
+        source_chat_id = normalize_chat_id(
+            sid_val,
+            key="source_chat_id",
+            allow_disabled=False,
+        )
     except Exception:
         errors.append("source_chat_id must be integer")
         source_chat_id = None
 
+    # source_chat_id_2: optional integer; blank/null/0 disables it
+    try:
+        from bot_settings import normalize_chat_id
+
+        source_chat_id_2 = normalize_chat_id(
+            get("source_chat_id_2"),
+            key="source_chat_id_2",
+            allow_disabled=True,
+        )
+    except Exception:
+        errors.append("source_chat_id_2 must be integer or empty")
+        source_chat_id_2 = None
+
     # tp2_pips constraint: >= tp1_pips
     if tp1_pips is not None and tp2_pips is not None and tp2_pips < tp1_pips:
         errors.append("tp2_pips must be >= tp1_pips")
+
+    # MT5 account settings
+    try:
+        mt5_login = _parse_positive_int(get("mt5_login"), field_name="mt5_login")
+    except ValueError as e:
+        errors.append(str(e))
+        mt5_login = None
+
+    raw_mt5_password = get("mt5_password")
+    raw_mt5_password_text = "" if raw_mt5_password is None else str(raw_mt5_password).strip()
+    if raw_mt5_password_text in {"", "<masked>"}:
+        mt5_password = existing_cfg.get("mt5_password")
+        if not mt5_password:
+            try:
+                from bot_settings import load_settings
+
+                mt5_password = load_settings().mt5_password
+            except Exception:
+                mt5_password = None
+        if not mt5_password:
+            errors.append("mt5_password must not be empty")
+    else:
+        try:
+            mt5_password = _parse_non_empty_text(
+                str(raw_mt5_password),
+                field_name="mt5_password",
+            )
+        except ValueError as e:
+            errors.append(str(e))
+            mt5_password = None
+
+    try:
+        mt5_server = _parse_non_empty_text(get("mt5_server"), field_name="mt5_server")
+    except ValueError as e:
+        errors.append(str(e))
+        mt5_server = None
+
+    try:
+        mt5_path = _parse_non_empty_text(get("mt5_path"), field_name="mt5_path")
+    except ValueError as e:
+        errors.append(str(e))
+        mt5_path = None
 
     if errors:
         raise ValueError("; ".join(errors))
@@ -176,6 +307,14 @@ def _validate_and_build_settings_from_input(input_obj: dict) -> dict:
         "monitor_interval": monitor_interval,
         "telegram_test_mode": telegram_test_mode,
         "source_chat_id": source_chat_id,
+        "source_chat_id_2": source_chat_id_2,
+        "miss_entry_cancel_enabled": miss_entry_cancel_enabled,
+        "miss_entry_runaway_cancel_pips": miss_entry_runaway_cancel_pips,
+        "near_entry_max_pips": near_entry_max_pips,
+        "mt5_login": mt5_login,
+        "mt5_password": mt5_password,
+        "mt5_server": mt5_server,
+        "mt5_path": mt5_path,
     }
 
 
@@ -188,7 +327,7 @@ def _write_bot_config_with_backup(new_config: dict) -> None:
     prev_dict = dict(prev) if isinstance(prev, dict) else {}
 
     merged = dict(prev_dict)
-    merged.update(_safe_extract_allowed_keys(new_config))
+    merged.update(_safe_extract_allowed_keys(new_config, mask_sensitive=False))
     if "layers" in new_config:
         merged["layers"] = new_config["layers"]
 
@@ -265,7 +404,9 @@ def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0, or
     enabled_val = get_field("enabled", "true")
     name_val = get_field("name", "L1")
     lot_val = get_field("lot", "")
+    entry_percent_val = get_field("entry_percent", "50")
     tp_enabled_val = get_field("tp_enabled", "true")
+    tp_mode_val = get_field("tp_mode", "pips")
     tp_pips_val = get_field("tp_pips", "")
     be_enabled_val = get_field("be_enabled", "false")
     be_trigger_pips_val = get_field("be_trigger_pips", "50")
@@ -292,17 +433,49 @@ def _render_editable_layer_form(layer_data: dict | None = None, idx: int = 0, or
             '</div>'
         )
 
+    def select_row(label: str, field_name: str, value: str, options: list[tuple[str, str]]) -> str:
+        option_html = ""
+        for option_value, option_label in options:
+            selected = ' selected="selected"' if value == option_value else ""
+            option_html += (
+                f'<option value="{_html_escape(option_value)}"{selected}>'
+                f'{_html_escape(option_label)}'
+                '</option>'
+            )
+        return (
+            '<div style="margin-bottom:12px;">'
+            f'<div style="margin-bottom:6px;font-weight:700;">{_html_escape(label)}</div>'
+            f'<select name="layers[{idx}][{field_name}]">{option_html}</select>'
+            '</div>'
+        )
+
     # Determine layer title with order name
     layer_title = f"Layer {idx + 1} / {order_name}" if order_name else f"Layer {idx + 1}"
 
     return (
-        '<div style="margin-top:10px;padding:12px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">'
-        f'<div style="font-weight:800;margin-bottom:12px;">{_html_escape(layer_title)}</div>'
+        '<div data-layer-card="1" style="margin-top:10px;padding:12px;border-radius:8px;border:1px solid #e9ecef;background:#fff;">'
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;">'
+        f'<div style="font-weight:800;">{_html_escape(layer_title)}</div>'
+        '<button type="button" onclick="deleteLayer(this)" '
+        'style="padding:5px 9px;border:1px solid #dc3545;border-radius:4px;background:#fff;color:#dc3545;">'
+        'Hapus'
+        '</button>'
+        '</div>'
         '<div style="margin-top:8px;color:#333;line-height:1.8;">'
         + checkbox_row("enabled", "enabled", is_checkbox_checked(enabled_val))
         + text_row("name", "name", name_val)
         + text_row("lot", "lot", lot_val, "e.g., 0.01")
+        + text_row("entry_percent (%)", "entry_percent", entry_percent_val, "0-100, e.g., 50")
         + checkbox_row("tp_enabled", "tp_enabled", is_checkbox_checked(tp_enabled_val))
+        + select_row(
+            "tp_mode",
+            "tp_mode",
+            tp_mode_val,
+            [
+                ("pips", "TP berdasarkan pips"),
+                ("first_entry_pips", "TP pips dari entry pertama"),
+            ],
+        )
         + text_row("tp_pips", "tp_pips", tp_pips_val, "e.g., 50")
         + checkbox_row("be_enabled", "be_enabled", is_checkbox_checked(be_enabled_val))
         + text_row("be_trigger_pips", "be_trigger_pips", be_trigger_pips_val)
@@ -340,7 +513,9 @@ def _render_layer_card(layer: dict[str, Any], idx: int) -> str:
         + row("name", layer.get("name", ""))
         + row("enabled", layer.get("enabled", ""))
         + row("lot", layer.get("lot", ""))
+        + row("entry_percent", layer.get("entry_percent", ""))
         + row("tp_enabled", layer.get("tp_enabled", ""))
+        + row("tp_mode", layer.get("tp_mode", ""))
         + row("tp_pips", layer.get("tp_pips", ""))
         + row("be_enabled", layer.get("be_enabled", ""))
         + row("be_trigger_pips", layer.get("be_trigger_pips", ""))
@@ -352,21 +527,7 @@ def _render_layer_card(layer: dict[str, Any], idx: int) -> str:
 
 
 def _get_default_layer_for_index(raw_cfg: dict, idx: int) -> dict:
-    """Build default layer data for the specified index (0-2 for Layer 1-3).
-    
-    Derives layer defaults from legacy config fields to avoid validation failures.
-    Each layer has a specific purpose:
-    - Layer 0 (TG-TP1): First TP ladder
-    - Layer 1 (TG-TP2): Second TP ladder  
-    - Layer 2 (TG-NO-TP): No TP order
-    
-    Args:
-        raw_cfg: raw bot_config.json dict
-        idx: layer index (0, 1, or 2)
-        
-    Returns:
-        dict with layer form defaults
-    """
+    """Build default layer data for a layer form."""
     legacy_lot = raw_cfg.get("lot", 0.01)
     
     if idx == 0:
@@ -375,7 +536,9 @@ def _get_default_layer_for_index(raw_cfg: dict, idx: int) -> dict:
             "enabled": True,
             "name": "L1",
             "lot": legacy_lot,
+            "entry_percent": 50,
             "tp_enabled": True,
+            "tp_mode": "pips",
             "tp_pips": raw_cfg.get("tp1_pips", 50),
             "be_enabled": False,
             "be_trigger_pips": 50,
@@ -388,60 +551,107 @@ def _get_default_layer_for_index(raw_cfg: dict, idx: int) -> dict:
             "enabled": True,
             "name": "L2",
             "lot": legacy_lot,
+            "entry_percent": 50,
             "tp_enabled": True,
+            "tp_mode": "pips",
             "tp_pips": raw_cfg.get("tp2_pips", 100),
             "be_enabled": False,
             "be_trigger_pips": 50,
             "be_offset_pips": 0,
             "comment": "TG-TP2",
         }
-    else:  # idx == 2
+    elif idx == 2:
         # Layer 3 / TG-NO-TP
         return {
             "enabled": True,
             "name": "L3",
             "lot": legacy_lot,
+            "entry_percent": 50,
             "tp_enabled": False,
+            "tp_mode": "pips",
             "tp_pips": 0,
             "be_enabled": False,
             "be_trigger_pips": 50,
             "be_offset_pips": 0,
             "comment": "TG-NO-TP",
         }
+    else:
+        layer_num = idx + 1
+        return {
+            "enabled": True,
+            "name": f"L{layer_num}",
+            "lot": legacy_lot,
+            "entry_percent": 50,
+            "tp_enabled": True,
+            "tp_mode": "pips",
+            "tp_pips": raw_cfg.get("tp2_pips", 100),
+            "be_enabled": False,
+            "be_trigger_pips": 50,
+            "be_offset_pips": 0,
+            "comment": f"TG-L{layer_num}",
+        }
 
 
-def _render_layers_section(raw_cfg: dict) -> str:
-    """Render Layer Settings UI for exactly 3 fixed layers.
+def _coerce_layer_count(value, raw_cfg: dict) -> int:
+    try:
+        requested_count = int(value)
+    except (TypeError, ValueError):
+        requested_count = 0
 
-    Phase 3D-3 requirement:
-    - Always render exactly 3 editable layer forms (Layer 1, 2, 3)
-    - If bot_config.json has fewer than 3 layers, fill with safe defaults
-    - Each layer maps to an order: L1->TG-TP1, L2->TG-TP2, L3->TG-NO-TP
+    return max(0, min(requested_count, MAX_LAYERS))
 
-    Note:
-    - Runtime currently uses only enabled + lot per layer
-    - TP/BE/comment fields are saved but not active yet
-    """
+
+def _render_layers_section(raw_cfg: dict, layer_count: int | None = None) -> str:
+    """Render dynamic Layer Settings UI."""
     order_names = ["TG-TP1", "TG-TP2", "TG-NO-TP"]
     raw_layers = raw_cfg.get("layers", [])
     
     # Ensure raw_layers is a list
     if not isinstance(raw_layers, list):
         raw_layers = []
-    
-    # Build all 3 layer forms
+
+    render_count = _coerce_layer_count(layer_count, raw_cfg)
+    next_count = min(render_count + 1, MAX_LAYERS)
+    if render_count >= MAX_LAYERS:
+        add_button_html = (
+            '<button type="button" disabled style="opacity:0.55; cursor:not-allowed;">'
+            '+ Tambah Layer'
+            '</button>'
+        )
+    else:
+        add_button_html = (
+            '<a href="/?layer_count='
+            + _html_escape(str(next_count))
+            + '#layers" '
+            'style="display:inline-block;padding:6px 10px;border:1px solid #adb5bd;'
+            'border-radius:4px;background:#f8f9fa;color:#111;text-decoration:none;">'
+            '+ Tambah Layer'
+            '</a>'
+        )
+
+    add_layer_html = (
+        '<div style="margin-top:10px;">'
+        + add_button_html
+        + '</div>'
+        '<div style="margin-top:6px;color:#666;">'
+        f'Total layer ditampilkan: {_html_escape(str(render_count))}. Klik Simpan untuk menyimpan layer baru.'
+        '</div>'
+    )
+
     layers_html = ""
-    for idx in range(3):
+    for idx in range(render_count):
         # Use existing layer if available, otherwise use defaults
         if idx < len(raw_layers) and isinstance(raw_layers[idx], dict):
             layer_data = raw_layers[idx]
         else:
             layer_data = _get_default_layer_for_index(raw_cfg, idx)
+
+        order_name = order_names[idx] if idx < len(order_names) else f"TG-L{idx + 1}"
         
         layers_html += _render_editable_layer_form(
             layer_data=layer_data,
             idx=idx,
-            order_name=order_names[idx]
+            order_name=order_name,
         )
     
     # Add info note about what's currently active
@@ -449,14 +659,17 @@ def _render_layers_section(raw_cfg: dict) -> str:
         '<div style="margin-top:16px;padding:12px;border-radius:8px;background:#e7f3ff;border:1px solid #b3d9ff;color:#004085;font-size:14px;line-height:1.6;">'
         '<strong>ℹ️ Runtime Status:</strong><br/>'
 'Runtime active: <strong>enabled</strong>, <strong>lot</strong>, <strong>TP</strong>.<br/>'
-        'Saved only: <strong>BE</strong>, <strong>comment</strong>. MT5 comments remain fixed for BE tracking.<br/><br/>'
+        'Entry percent active: SELL <strong>0</strong>=low/<strong>100</strong>=high; BUY <strong>0</strong>=high/<strong>100</strong>=low; <strong>50</strong>=middle.<br/>'
+        'TP mode active: <strong>pips</strong> atau <strong>first_entry_pips</strong>.<br/>'
+        'BE active: trigger dan offset memakai setting <strong>Layer 1 / TG-TP1</strong>.<br/>'
+        'Saved only: <strong>comment</strong> untuk order layer tambahan.<br/><br/>'
         '<strong>Safe reset command:</strong><br/>'
 '<code>.\\.venv\\Scripts\\python.exe .\\reset_safe_layers.py --apply</code>'
         '</div>'
 
     )
     
-    return layers_html + note
+    return add_layer_html + layers_html + note
 
 
 
@@ -465,7 +678,9 @@ LAYER_FIELD_NAMES = (
     "name",
     "enabled",
     "lot",
+    "entry_percent",
     "tp_enabled",
+    "tp_mode",
     "tp_pips",
     "be_enabled",
     "be_trigger_pips",
@@ -616,10 +831,26 @@ def _validate_layer_item(raw_layer: dict, idx: int) -> dict:
     if lot <= 0:
         raise ValueError(f"layers[{idx}].lot must be > 0")
 
+    entry_percent = _parse_layer_float(
+        raw_layer.get("entry_percent"), f"layers[{idx}].entry_percent", min_value=0
+    )
+    if entry_percent > 100:
+        raise ValueError(f"layers[{idx}].entry_percent must be <= 100")
+
     tp_enabled = _parse_layer_bool(raw_layer.get("tp_enabled"), f"layers[{idx}].tp_enabled")
+    tp_mode = raw_layer.get("tp_mode", "pips")
+    if not isinstance(tp_mode, str):
+        raise ValueError(f"layers[{idx}].tp_mode must be a string")
+    tp_mode = tp_mode.strip()
+    if tp_mode not in {"pips", "first_entry_pips"}:
+        raise ValueError(
+            f"layers[{idx}].tp_mode must be pips or first_entry_pips"
+        )
     tp_pips = _parse_layer_int(raw_layer.get("tp_pips"), f"layers[{idx}].tp_pips", min_value=0)
     if tp_enabled and tp_pips <= 0:
-        raise ValueError(f"layers[{idx}].tp_pips must be > 0 when tp_enabled is true")
+        raise ValueError(
+            f"layers[{idx}].tp_pips must be > 0 when tp_enabled is true and tp_mode uses pips"
+        )
 
     be_enabled = _parse_layer_bool(raw_layer.get("be_enabled"), f"layers[{idx}].be_enabled")
     be_trigger_pips = _parse_layer_int(
@@ -638,12 +869,13 @@ def _validate_layer_item(raw_layer: dict, idx: int) -> dict:
     if len(comment) > 40:
         raise ValueError(f"layers[{idx}].comment must be at most 40 characters")
 
-    # comment is plain metadata only; do not use it for runtime matching yet.
     return {
         "name": name,
         "enabled": enabled,
         "lot": lot,
+        "entry_percent": entry_percent,
         "tp_enabled": tp_enabled,
+        "tp_mode": tp_mode,
         "tp_pips": tp_pips,
         "be_enabled": be_enabled,
         "be_trigger_pips": be_trigger_pips,
@@ -749,7 +981,7 @@ def _render_root_page(*, cfg: dict, raw_cfg: dict | None = None, layers_html: st
     th, td { border: 1px solid #ddd; padding: 8px; }
     th { background: #f6f6f6; text-align: left; }
     code { background: #f6f6f6; padding: 2px 4px; border-radius: 3px; }
-    input[type="text"] { width: 220px; }
+    input[type="text"], input[type="password"] { width: 220px; }
 
     .status-banner{display:flex;align-items:center;gap:12px;padding:12px 14px;margin:12px 0;border-radius:10px;border:1px solid #e9ecef;background:#f8f9fa;}
     .status-light{width:18px;height:18px;border-radius:50%;background:#999;box-shadow:0 0 0 4px rgba(0,0,0,0.03);}
@@ -757,6 +989,9 @@ def _render_root_page(*, cfg: dict, raw_cfg: dict | None = None, layers_html: st
     .status-light.red{background:#dc3545;}
     .status-light.yellow{background:#ffc107;}
     .status-banner .status-text{font-weight:800;letter-spacing:0.2px;}
+    .action-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:14px 0;max-width:760px;}
+    .action-row button{padding:6px 10px;}
+    .action-row .msg{margin-left:4px;color:#666;}
   </style>
 </head>
 <body>
@@ -772,32 +1007,46 @@ def _render_root_page(*, cfg: dict, raw_cfg: dict | None = None, layers_html: st
 
   @@SAFETY_STATUS@@
 
-  <h2>Config (Safe Fields)</h2>
-  <form method="POST" action="/config">
+  <form id="configForm" method="POST" action="/config">
+    <input type="hidden" name="lot" value="@@LOT@@" />
+    <input type="hidden" name="pip" value="@@PIP@@" />
+    <input type="hidden" name="tp1_pips" value="@@TP1_PIPS@@" />
+    <input type="hidden" name="tp2_pips" value="@@TP2_PIPS@@" />
+    <input type="hidden" name="sl_buffer" value="@@SL_BUFFER@@" />
+
+    <div class="action-row">
+      <button type="button" onclick="botStop()">Stop</button>
+      <button type="button" onclick="botStart()">Start</button>
+      <button type="button" onclick="botRestart()">Restart</button>
+      <button type="submit">Simpan</button>
+      <span id="botActionMsg" class="msg"></span>
+    </div>
+
+    <h2>Config (Safe Fields)</h2>
     <table>
-      <tr><th>lot</th><td><input type="text" name="lot" value="@@LOT@@" /></td></tr>
-      <tr><th>pip</th><td><input type="text" name="pip" value="@@PIP@@" /></td></tr>
-      <tr><th>tp1_pips</th><td><input type="text" name="tp1_pips" value="@@TP1_PIPS@@" /></td></tr>
-      <tr><th>tp2_pips</th><td><input type="text" name="tp2_pips" value="@@TP2_PIPS@@" /></td></tr>
-      <tr><th>sl_buffer</th><td><input type="text" name="sl_buffer" value="@@SL_BUFFER@@" /></td></tr>
       <tr><th>emergency_sl_pips</th><td><input type="text" name="emergency_sl_pips" value="@@EMERGENCY_SL_PIPS@@" /></td></tr>
       <tr><th>monitor_interval</th><td><input type="text" name="monitor_interval" value="@@MONITOR_INTERVAL@@" /></td></tr>
+      <tr><th>miss_entry_cancel_enabled</th><td><input type="text" name="miss_entry_cancel_enabled" value="@@MISS_ENTRY_CANCEL_ENABLED@@" /> <span style="color:#666;">true/false</span></td></tr>
+      <tr><th>miss_entry_runaway_cancel_pips</th><td><input type="text" name="miss_entry_runaway_cancel_pips" value="@@MISS_ENTRY_RUNAWAY_CANCEL_PIPS@@" /> <span style="color:#666;">pips dari entry pertama</span></td></tr>
+      <tr><th>near_entry_max_pips</th><td><input type="text" name="near_entry_max_pips" value="@@NEAR_ENTRY_MAX_PIPS@@" /> <span style="color:#666;">pips dianggap hampir menyentuh entry</span></td></tr>
       <tr><th>telegram_test_mode</th><td><input type="text" name="telegram_test_mode" value="@@TELEGRAM_TEST_MODE@@" /> <span style="color:#666;">true/false</span></td></tr>
-      <tr><th>source_chat_id</th><td><input type="text" name="source_chat_id" value="@@SOURCE_CHAT_ID@@" /></td></tr>
+      <tr><th>Source Chat ID 1</th><td><input type="text" name="source_chat_id" value="@@SOURCE_CHAT_ID@@" /></td></tr>
+      <tr><th>Source Chat ID 2</th><td><input type="text" name="source_chat_id_2" value="@@SOURCE_CHAT_ID_2@@" /> <span style="color:#666;">optional</span></td></tr>
     </table>
 
-    <div style="padding:12px;background:#f8f9fa;border:1px solid #e9ecef;border-radius:10px;max-width:760px;margin:14px 0;">
+    <h2>MT5 Account Settings</h2>
+    <table>
+      <tr><th>MT5 Login / Trading Account</th><td><input type="text" name="mt5_login" value="@@MT5_LOGIN@@" /></td></tr>
+      <tr><th>MT5 Password</th><td><input type="password" name="mt5_password" value="" placeholder="Leave blank to keep existing password" style="width:320px;" /></td></tr>
+      <tr><th>MT5 Server</th><td><input type="text" name="mt5_server" value="@@MT5_SERVER@@" /></td></tr>
+      <tr><th>MT5 Terminal Path</th><td><input type="text" name="mt5_path" value="@@MT5_PATH@@" style="width:460px;max-width:95%;" /></td></tr>
+    </table>
+
+    <div id="layers" style="padding:12px;background:#f8f9fa;border:1px solid #e9ecef;border-radius:10px;max-width:760px;margin:14px 0;">
       <div style="font-weight:800;margin-bottom:6px;">Layer Settings</div>
       <div style="color:#333;">
-        Layer 1 sudah bisa disimpan ke bot_config.json lewat tombol Simpan. Saat ini order execution masih memakai legacy logic.
+        Layer bisa disimpan ke bot_config.json lewat tombol Simpan.
 
-      </div>
-
-      <div style="margin-top:10px;">
-        <button type="button" disabled style="opacity:0.55; cursor:not-allowed;">+ Tambah Layer</button>
-      </div>
-      <div style="margin-top:6px;color:#666;">
-        Tombol ini baru tampilan. Add/remove layer akan diaktifkan pada phase berikutnya.
       </div>
 
       @@LAYERS_SECTION@@
@@ -808,7 +1057,9 @@ def _render_root_page(*, cfg: dict, raw_cfg: dict | None = None, layers_html: st
           <li>Aktif / nonaktif layer</li>
           <li>Nama layer</li>
           <li>Lot per layer</li>
+          <li>Entry percent</li>
           <li>TP aktif / nonaktif</li>
+          <li>TP mode</li>
           <li>TP pips</li>
           <li>BE aktif / nonaktif</li>
           <li>BE trigger pips</li>
@@ -818,12 +1069,10 @@ def _render_root_page(*, cfg: dict, raw_cfg: dict | None = None, layers_html: st
       </div>
 
       <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;border-radius:8px;">
-        Catatan: Layer config sudah tersimpan, tetapi belum dipakai untuk eksekusi order sampai phase berikutnya.
+        Catatan: Perubahan config baru aktif setelah bot direstart.
 
       </div>
     </div>
-
-    <p><button type="submit">Simpan</button></p>
   </form>
 
   <h2>Status</h2>
@@ -832,17 +1081,6 @@ def _render_root_page(*, cfg: dict, raw_cfg: dict | None = None, layers_html: st
     bot_process_hint: <code>process status only (Phase 3C)</code>
   </div>
 
-
-<h2>Bot Controls</h2>
-  <div style="padding:10px;background:#f8f9fa;border:1px solid #e9ecef;margin:10px 0;">
-    <div style="margin-bottom:8px;color:#333;">Phase 3E: safe process control (localhost)</div>
-    <button type="button" onclick="botStart()">Start Bot</button>
-    <button type="button" onclick="botStop()" style="margin-left:8px;">Stop Bot</button>
-    <button type="button" onclick="return false;" id="btnRestart" style="margin-left:8px; opacity:0.55;" disabled>Restart disabled - use Stop then Start</button>
-
-    <div style="margin-top:10px;color:#856404;background:#fff3cd;border:1px solid #ffeeba;padding:10px;">
-      Stop Bot uses a safe stop request handled by run_bot.py. No processes are killed by the panel.
-    </div>
   @@BOT_PROCESS_SECTION@@
 
 <script>
@@ -862,37 +1100,51 @@ function _showMsg(ok, message) {
   el.textContent = message || (ok ? 'Success' : 'Failed');
 }
 
-async function _refreshStatus() {
-  try {
-    const res = await fetch('/api/status');
-    if (!res.ok) return window.location.reload();
-  } catch (e) {
-    return window.location.reload();
-  }
+function _refreshPage() {
   window.location.reload();
+}
+
+function deleteLayer(button) {
+  const card = button ? button.closest('[data-layer-card]') : null;
+  if (card) {
+    card.remove();
+  }
 }
 
 async function botStart() {
   _showMsg(true, 'Starting bot...');
-  const { res, data } = await _postJson('/bot/start');
-  const ok = data && data.ok === true;
-  const msg = data && data.message ? data.message : ('HTTP ' + res.status);
-  _showMsg(ok, msg);
-  if (ok) await _refreshStatus(); else await _refreshStatus();
+  try {
+    const { res, data } = await _postJson('/bot/start');
+    const ok = data && data.ok === true;
+    const msg = data && data.message ? data.message : ('HTTP ' + res.status);
+    _showMsg(ok, msg);
+  } finally {
+    _refreshPage();
+  }
 }
 
 async function botStop() {
   _showMsg(true, 'Stopping bot...');
-  const { res, data } = await _postJson('/bot/stop');
-  const ok = data && data.ok === true;
-  const msg = data && data.message ? data.message : ('HTTP ' + res.status);
-  _showMsg(ok, msg);
-  if (ok) await _refreshStatus(); else await _refreshStatus();
+  try {
+    const { res, data } = await _postJson('/bot/stop');
+    const ok = data && data.ok === true;
+    const msg = data && data.message ? data.message : ('HTTP ' + res.status);
+    _showMsg(ok, msg);
+  } finally {
+    _refreshPage();
+  }
 }
 
 async function botRestart() {
-  // Disabled for Phase 3D. Button is also rendered as disabled.
-  _showMsg(false, 'Restart is temporarily disabled. Use Stop then Start.');
+  _showMsg(true, 'Restarting bot...');
+  try {
+    const { res, data } = await _postJson('/bot/restart');
+    const ok = data && data.ok === true;
+    const msg = data && data.message ? data.message : ('HTTP ' + res.status);
+    _showMsg(ok, msg);
+  } finally {
+    _refreshPage();
+  }
 }
 
 </script>
@@ -1032,8 +1284,19 @@ async function botRestart() {
         "@@SL_BUFFER@@": _html_escape(val("sl_buffer")),
         "@@EMERGENCY_SL_PIPS@@": _html_escape(val("emergency_sl_pips")),
         "@@MONITOR_INTERVAL@@": _html_escape(val("monitor_interval")),
+        "@@MISS_ENTRY_CANCEL_ENABLED@@": _html_escape(val("miss_entry_cancel_enabled", "true")),
+        "@@MISS_ENTRY_RUNAWAY_CANCEL_PIPS@@": _html_escape(
+            val("miss_entry_runaway_cancel_pips", val("tp1_pips"))
+        ),
+        "@@NEAR_ENTRY_MAX_PIPS@@": _html_escape(val("near_entry_max_pips", "20")),
         "@@TELEGRAM_TEST_MODE@@": _html_escape(val("telegram_test_mode")),
         "@@SOURCE_CHAT_ID@@": _html_escape(val("source_chat_id")),
+        "@@SOURCE_CHAT_ID_2@@": _html_escape(val("source_chat_id_2")),
+        "@@MT5_LOGIN@@": _html_escape(val("mt5_login", "2171142772")),
+        "@@MT5_SERVER@@": _html_escape(val("mt5_server", "ValetaxIntl-Live7")),
+        "@@MT5_PATH@@": _html_escape(
+            val("mt5_path", r"C:\Program Files\MetaTrader 5\terminal64.exe")
+        ),
 
         "@@BOT_CONTROLS_SECTION@@": "",
     }
@@ -1399,12 +1662,27 @@ def _stop_bot_stack() -> dict:
 
 def _restart_bot_stack() -> dict:
     stop_resp = _stop_bot_stack()
-    # If stop refused due to not running, follow spec: restart uses same stop helper.
     if not stop_resp.get("ok"):
         return stop_resp
 
-    time.sleep(0.5)
-    return _start_bot_stack()
+    for _ in range(20):
+        status_poll = _compute_bot_stack_status()
+        any_still_running = bool(
+            status_poll.get("run_bot_running")
+            or status_poll.get("telegram_listener_running")
+            or status_poll.get("be_monitor_running")
+        )
+        if not any_still_running:
+            return _start_bot_stack()
+        time.sleep(0.5)
+
+    status_after = _compute_bot_stack_status()
+    return {
+        "ok": False,
+        "http_code": 409,
+        "message": "Restart stopped waiting because bot shutdown is still in progress",
+        "bot_status": status_after,
+    }
 
 
 
@@ -1465,8 +1743,7 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
             self._handle_post_bot_action("stop")
             return
         if path in {"/bot/restart", "/api/bot/restart"}:
-            # Phase 3D: restart is temporarily disabled to avoid unstable state.
-            self._handle_post_bot_action("restart_disabled")
+            self._handle_post_bot_action("restart")
             return
 
 
@@ -1550,10 +1827,12 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path
         try:
-            saved = "saved" in parse_qs(parsed.query)
+            query = parse_qs(parsed.query)
+            saved = "saved" in query
+            layer_count_param = (query.get("layer_count") or [None])[0]
             raw_cfg = _safe_load_bot_config_json()
             cfg = _safe_extract_allowed_keys(raw_cfg)
-            layers_html = _render_layers_section(raw_cfg)
+            layers_html = _render_layers_section(raw_cfg, layer_count=layer_count_param)
             html_page = _render_root_page(cfg=cfg, raw_cfg=raw_cfg, layers_html=layers_html, saved=saved)
             self._send(200, "text/html; charset=utf-8", html_page.encode("utf-8"))
         except Exception as e:
@@ -1571,17 +1850,27 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
 
         raw_cfg = _safe_load_bot_config_json()
         prev_cfg = _safe_extract_allowed_keys(raw_cfg)
-        layers_html = _render_layers_section(raw_cfg)
+        try:
+            raw_layers_for_error = _extract_layers_from_form_qs(parsed)
+        except Exception:
+            raw_layers_for_error = None
+        layer_count_for_error = len(raw_layers_for_error) if raw_layers_for_error is not None else None
+        layers_html = _render_layers_section(raw_cfg, layer_count=layer_count_for_error)
 
         try:
             validated = _validate_and_build_settings_from_input(input_obj)
             raw_layers = _extract_layers_from_form_qs(parsed)
+            saved_layer_count = 0
             if raw_layers is not None:
                 validated_layers = _validate_layers_config(raw_layers)
                 validated["layers"] = validated_layers
+                saved_layer_count = len(validated_layers)
             _write_bot_config_with_backup(validated)
             self.send_response(302)
-            self.send_header("Location", "/?saved=1")
+            location = "/?saved=1"
+            if saved_layer_count > 0:
+                location = f"/?saved=1&layer_count={saved_layer_count}#layers"
+            self.send_header("Location", location)
             self.end_headers()
         except Exception as e:
             html = _render_root_page(cfg=prev_cfg, raw_cfg=raw_cfg, layers_html=layers_html, error=str(e), saved=False)
@@ -1629,12 +1918,7 @@ class LocalControlPanelHandler(BaseHTTPRequestHandler):
             elif action == "stop":
                 resp = _stop_bot_stack()
             elif action == "restart":
-                resp = {
-                    "ok": False,
-                    "http_code": 409,
-                    "message": "Restart is temporarily disabled. Use Stop then Start.",
-                    "bot_status": _compute_bot_stack_status(),
-                }
+                resp = _restart_bot_stack()
             elif action == "restart_disabled":
                 resp = {
                     "ok": False,

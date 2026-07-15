@@ -17,9 +17,21 @@ class BotSettings:
     monitor_interval: float
     telegram_test_mode: bool
     source_chat_id: int
+    source_chat_id_2: int | None
+    miss_entry_cancel_enabled: bool
+    miss_entry_runaway_cancel_pips: float
+    near_entry_max_pips: float
+    mt5_login: int
+    mt5_password: str
+    mt5_server: str
+    mt5_path: str
 
 
 _DEFAULT_FILENAME = "bot_config.json"
+_DEFAULT_MT5_LOGIN = 2171142772
+_DEFAULT_MT5_SERVER = "ValetaxIntl-Live7"
+_DEFAULT_MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+_DEFAULT_MT5_ACCOUNT_SECRET = ""
 
 
 def _require_key(obj: dict[str, Any], key: str) -> Any:
@@ -56,6 +68,49 @@ def _as_bool(value: Any, *, key: str) -> bool:
     return value
 
 
+def _as_non_empty_config_str(value: Any, *, key: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"Config key '{key}' must be a string; got: {type(value).__name__}")
+    value = value.strip()
+    if not value:
+        raise ValueError(f"Config key '{key}' must be a non-empty string")
+    return value
+
+
+def _as_optional_bool(value: Any, *, key: str, default: bool) -> bool:
+    if value is None:
+        return default
+    return _as_bool(value, key=key)
+
+
+def normalize_chat_id(value: Any, *, key: str, allow_disabled: bool = False) -> int | None:
+    if isinstance(value, bool):
+        raise ValueError(f"Config key '{key}' must be an integer; got bool")
+
+    if value is None:
+        if allow_disabled:
+            return None
+        raise ValueError(f"Config key '{key}' must be an integer; got: {value!r}")
+
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized == "":
+            if allow_disabled:
+                return None
+            raise ValueError(f"Config key '{key}' must be an integer; got: {value!r}")
+        try:
+            chat_id = int(normalized)
+        except ValueError as e:
+            raise ValueError(f"Config key '{key}' must be an integer; got: {value!r}") from e
+    else:
+        chat_id = _as_int(value, key=key)
+
+    if allow_disabled and chat_id == 0:
+        return None
+
+    return chat_id
+
+
 def load_settings(path: str | Path | None = None) -> BotSettings:
     base_dir = Path(__file__).resolve().parent
     config_path = Path(path) if path is not None else (base_dir / _DEFAULT_FILENAME)
@@ -72,7 +127,7 @@ def load_settings(path: str | Path | None = None) -> BotSettings:
     if not isinstance(data, dict):
         raise ValueError(f"Config root must be a JSON object; got: {type(data).__name__}")
 
-    # Strict parsing: do not silently invent defaults.
+    # Strict parsing for trading controls; MT5 account fields keep legacy defaults below.
     lot = _as_number(_require_key(data, "lot"), key="lot")
     pip = _as_number(_require_key(data, "pip"), key="pip")
     tp1_pips = _as_int(_require_key(data, "tp1_pips"), key="tp1_pips")
@@ -83,7 +138,39 @@ def load_settings(path: str | Path | None = None) -> BotSettings:
     telegram_test_mode = _as_bool(
         _require_key(data, "telegram_test_mode"), key="telegram_test_mode"
     )
-    source_chat_id = _as_int(_require_key(data, "source_chat_id"), key="source_chat_id")
+    source_chat_id = normalize_chat_id(
+        _require_key(data, "source_chat_id"),
+        key="source_chat_id",
+        allow_disabled=False,
+    )
+    source_chat_id_2 = normalize_chat_id(
+        data.get("source_chat_id_2"),
+        key="source_chat_id_2",
+        allow_disabled=True,
+    )
+    miss_entry_cancel_enabled = _as_optional_bool(
+        data.get("miss_entry_cancel_enabled"),
+        key="miss_entry_cancel_enabled",
+        default=True,
+    )
+    miss_entry_runaway_cancel_pips = _as_number(
+        data.get("miss_entry_runaway_cancel_pips", tp1_pips),
+        key="miss_entry_runaway_cancel_pips",
+    )
+    near_entry_max_pips = _as_number(
+        data.get("near_entry_max_pips", 20),
+        key="near_entry_max_pips",
+    )
+    mt5_login = _as_int(data.get("mt5_login", _DEFAULT_MT5_LOGIN), key="mt5_login")
+    mt5_password = str(data.get("mt5_password", _DEFAULT_MT5_ACCOUNT_SECRET) or "").strip()
+    mt5_server = _as_non_empty_config_str(
+        data.get("mt5_server", _DEFAULT_MT5_SERVER),
+        key="mt5_server",
+    )
+    mt5_path = _as_non_empty_config_str(
+        data.get("mt5_path", _DEFAULT_MT5_PATH),
+        key="mt5_path",
+    )
 
     # Validation rules
     if not (lot > 0):
@@ -104,6 +191,15 @@ def load_settings(path: str | Path | None = None) -> BotSettings:
         raise ValueError(f"Config key 'emergency_sl_pips' must be > 0; got: {emergency_sl_pips}")
     if monitor_interval < 1:
         raise ValueError(f"Config key 'monitor_interval' must be >= 1; got: {monitor_interval}")
+    if miss_entry_runaway_cancel_pips <= 0:
+        raise ValueError(
+            "Config key 'miss_entry_runaway_cancel_pips' must be > 0; "
+            f"got: {miss_entry_runaway_cancel_pips}"
+        )
+    if near_entry_max_pips < 0:
+        raise ValueError(f"Config key 'near_entry_max_pips' must be >= 0; got: {near_entry_max_pips}")
+    if mt5_login <= 0:
+        raise ValueError(f"Config key 'mt5_login' must be > 0; got: {mt5_login}")
 
     # telegram_test_mode + source_chat_id already validated by type conversions above.
     return BotSettings(
@@ -116,6 +212,14 @@ def load_settings(path: str | Path | None = None) -> BotSettings:
         monitor_interval=monitor_interval,
         telegram_test_mode=telegram_test_mode,
         source_chat_id=source_chat_id,
+        source_chat_id_2=source_chat_id_2,
+        miss_entry_cancel_enabled=miss_entry_cancel_enabled,
+        miss_entry_runaway_cancel_pips=miss_entry_runaway_cancel_pips,
+        near_entry_max_pips=near_entry_max_pips,
+        mt5_login=mt5_login,
+        mt5_password=mt5_password,
+        mt5_server=mt5_server,
+        mt5_path=mt5_path,
     )
 
 
@@ -130,6 +234,14 @@ def settings_to_dict(settings: BotSettings) -> dict[str, Any]:
         "monitor_interval": settings.monitor_interval,
         "telegram_test_mode": settings.telegram_test_mode,
         "source_chat_id": settings.source_chat_id,
+        "source_chat_id_2": settings.source_chat_id_2,
+        "miss_entry_cancel_enabled": settings.miss_entry_cancel_enabled,
+        "miss_entry_runaway_cancel_pips": settings.miss_entry_runaway_cancel_pips,
+        "near_entry_max_pips": settings.near_entry_max_pips,
+        "mt5_login": settings.mt5_login,
+        "mt5_password": "<masked>" if settings.mt5_password else "",
+        "mt5_server": settings.mt5_server,
+        "mt5_path": settings.mt5_path,
     }
 
 
@@ -167,6 +279,28 @@ def _as_int_ge(value: Any, *, key: str, min_value: int) -> int:
     return i
 
 
+def _as_optional_percent(value: Any, *, key: str) -> float | None:
+    if value is None:
+        return None
+    percent = _as_number(value, key=key)
+    if percent < 0 or percent > 100:
+        raise ValueError(f"Config key '{key}' must be between 0 and 100; got: {percent}")
+    return percent
+
+
+def _as_tp_mode(value: Any, *, key: str) -> str:
+    if value is None:
+        return "pips"
+    if not isinstance(value, str):
+        raise ValueError(f"Config key '{key}' must be a string; got: {type(value).__name__}")
+    mode = value.strip()
+    if mode not in {"pips", "first_entry_pips"}:
+        raise ValueError(
+            f"Config key '{key}' must be pips or first_entry_pips; got: {value!r}"
+        )
+    return mode
+
+
 def load_runtime_layers(path: str | Path | None = None) -> list[dict[str, Any]] | None:
     """Load and validate optional top-level runtime `layers` from bot_config.json.
 
@@ -177,7 +311,7 @@ def load_runtime_layers(path: str | Path | None = None) -> list[dict[str, Any]] 
 
     Notes:
         - This helper intentionally does NOT affect legacy load_settings().
-        - Runtime order execution is not wired to layers yet.
+        - Runtime order execution reads enabled, lot, entry_percent, and TP fields.
     """
 
     base_dir = Path(__file__).resolve().parent
@@ -219,11 +353,15 @@ def load_runtime_layers(path: str | Path | None = None) -> list[dict[str, Any]] 
         enabled = _as_str_bool(_require_key(item, "enabled"), key="layers[].enabled")
         name = _as_non_empty_str(_require_key(item, "name"), key="layers[].name", max_len=40)
         lot = _as_positive_number(_require_key(item, "lot"), key="layers[].lot")
+        entry_percent = _as_optional_percent(
+            item.get("entry_percent"), key="layers[].entry_percent"
+        )
         tp_enabled = _as_str_bool(_require_key(item, "tp_enabled"), key="layers[].tp_enabled")
+        tp_mode = _as_tp_mode(item.get("tp_mode"), key="layers[].tp_mode")
         tp_pips = _as_int_ge(_require_key(item, "tp_pips"), key="layers[].tp_pips", min_value=0)
         if tp_enabled and tp_pips <= 0:
             raise ValueError(
-                "layers[].tp_pips must be > 0 when tp_enabled is true"
+                "layers[].tp_pips must be > 0 when tp_enabled is true and tp_mode uses pips"
             )
         be_enabled = _as_str_bool(_require_key(item, "be_enabled"), key="layers[].be_enabled")
         be_trigger_pips = _as_int_ge(
@@ -239,7 +377,9 @@ def load_runtime_layers(path: str | Path | None = None) -> list[dict[str, Any]] 
                 "name": name,
                 "enabled": enabled,
                 "lot": lot,
+                "entry_percent": entry_percent,
                 "tp_enabled": tp_enabled,
+                "tp_mode": tp_mode,
                 "tp_pips": tp_pips,
                 "be_enabled": be_enabled,
                 "be_trigger_pips": be_trigger_pips,

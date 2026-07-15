@@ -57,24 +57,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# IMPORTANT: keep connection credentials as they were in the original be_monitor.py
-MT5_LOGIN = 2171043269  # real
-#MT5_LOGIN = 371863329  # demo
-
-
-MT5_PASSWORD = "sw34LOG2311@"  # Your MT5 account password
-
-
-MT5_SERVER = "ValetaxIntl-Live7"  # real
-#MT5_SERVER = "ValetaxIntl-Live2"  # demo
-
-
-# Load safe operational values from bot_config.json via bot_settings.py.
+# Load operational and MT5 account values from bot_config.json via bot_settings.py.
 # IMPORTANT: avoid duplicating PIP/TP constants here; those come from mt5_executor.
-from bot_settings import load_settings
+from bot_settings import load_runtime_layers, load_settings
 
 settings = load_settings()
 
+MT5_LOGIN = settings.mt5_login
+MT5_PASSWORD = settings.mt5_password
+MT5_SERVER = settings.mt5_server
+MT5_PATH = settings.mt5_path
 MONITOR_INTERVAL = settings.monitor_interval
 
 
@@ -84,18 +76,46 @@ TP3_COMMENT = "TG-NO-TP"
 BE_COMMENT = "TG-TP2-BE"
 BE_TP3_COMMENT = "TG-NO-TP-BE"
 NEAR_ENTRY_MIN_PIPS = 0
-NEAR_ENTRY_MAX_PIPS = 20
-MISS_ENTRY_RUNAWAY_CANCEL_PIPS = TP1_PIPS
+NEAR_ENTRY_MAX_PIPS = settings.near_entry_max_pips
+MISS_ENTRY_CANCEL_ENABLED = settings.miss_entry_cancel_enabled
+MISS_ENTRY_RUNAWAY_CANCEL_PIPS = settings.miss_entry_runaway_cancel_pips
 MISSED_ENTRY_CANCEL_REASON = "missed_entry_reached_tp1_after_near_entry"
 MISS_ENTRY_RUNAWAY_CANCEL_REASON = "missed_entry_runaway_without_fill"
 POSITION_MATCH_TOLERANCE_PIPS = 3
 TP1_PROOF_TOLERANCE_PIPS = 3
 
 
+def _load_layer1_be_config() -> dict:
+    try:
+        layers = load_runtime_layers()
+    except Exception as exc:
+        logger.warning("Could not load Layer 1 BE config; TP1 proof fallback will be used. error=%s", exc)
+        return {"enabled": False, "trigger_pips": TP1_PIPS, "offset_pips": 0.0}
+
+    if not layers:
+        return {"enabled": False, "trigger_pips": TP1_PIPS, "offset_pips": 0.0}
+
+    layer1 = layers[0]
+    return {
+        "enabled": bool(layer1.get("be_enabled", False)),
+        "trigger_pips": float(layer1.get("be_trigger_pips", TP1_PIPS) or 0),
+        "offset_pips": float(layer1.get("be_offset_pips", 0) or 0),
+    }
+
+
+LAYER1_BE_CONFIG = _load_layer1_be_config()
+
+
 def connect():
     """Initialize MT5, log in, and log account name and balance."""
-    if not mt5.initialize():
+    if not mt5.initialize(
+        path=MT5_PATH,
+        login=MT5_LOGIN,
+        password=MT5_PASSWORD,
+        server=MT5_SERVER,
+    ):
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+
 
     if not mt5.login(MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
         error = mt5.last_error()
@@ -1000,6 +1020,50 @@ def _tp1_safe_fallback_proof(snapshot: dict) -> dict:
     }
 
 
+def _l1_pip_be_proof(snapshot: dict) -> dict:
+    config = LAYER1_BE_CONFIG
+    if config.get("enabled") is not True:
+        return {"ok": False, "method": "l1_pips", "reason": "l1_be_disabled"}
+
+    direction = snapshot.get("direction")
+    entry_tp1 = snapshot.get("entry_tp1")
+    current_price = snapshot.get("current_price")
+    trigger_pips = float(config.get("trigger_pips") or 0)
+    if direction not in {"buy", "sell"}:
+        return {"ok": False, "method": "l1_pips", "reason": "invalid_direction"}
+    if entry_tp1 is None or current_price is None:
+        return {"ok": False, "method": "l1_pips", "reason": "entry_or_market_unavailable"}
+
+    if direction == "buy":
+        moved_pips = (float(current_price) - float(entry_tp1)) / PIP
+    else:
+        moved_pips = (float(entry_tp1) - float(current_price)) / PIP
+
+    if moved_pips < trigger_pips:
+        return {
+            "ok": False,
+            "method": "l1_pips",
+            "reason": "l1_be_trigger_not_reached",
+            "moved_pips": moved_pips,
+            "trigger_pips": trigger_pips,
+            "entry_tp1": entry_tp1,
+            "current_price": current_price,
+            "current_price_source": snapshot.get("current_price_source"),
+        }
+
+    return {
+        "ok": True,
+        "method": "l1_pips",
+        "reason": "l1_be_trigger_reached",
+        "moved_pips": moved_pips,
+        "trigger_pips": trigger_pips,
+        "entry_tp1": entry_tp1,
+        "current_price": current_price,
+        "current_price_source": snapshot.get("current_price_source"),
+        "offset_pips": float(config.get("offset_pips") or 0),
+    }
+
+
 def _send_be_for_position(
     order_id: int,
     layer_name: str,
@@ -1276,6 +1340,10 @@ def _runaway_threshold_price(direction: str, entry: float) -> float | None:
 def _attempt_missed_entry_cleanup(order_row: dict, snapshot: dict) -> tuple[str | None, str]:
     order_id = order_row["id"]
 
+    if not MISS_ENTRY_CANCEL_ENABLED:
+        logger.info("order_id=%s: missed-entry cleanup skip: disabled by config.", order_id)
+        return None, "miss_entry_cancel_disabled"
+
     if int(order_row.get("pending_cancelled") or 0) == 1:
         logger.info("order_id=%s: missed-entry cleanup skip: already marked cancelled.", order_id)
         return None, "already_marked_pending_cancelled"
@@ -1485,7 +1553,19 @@ def _attempt_be_for_row(order_row: dict, snapshot: dict) -> tuple[str, str]:
             )
             return "safe skip", f"{layer_name.lower()}_position_incomplete"
 
-        be_sl = _normalize_price(be_source_price, digits)
+        be_offset_pips = (
+            float(LAYER1_BE_CONFIG.get("offset_pips") or 0)
+            if LAYER1_BE_CONFIG.get("enabled") is True
+            else 0.0
+        )
+        be_source_with_offset = float(be_source_price)
+        if be_offset_pips:
+            if direction == "buy":
+                be_source_with_offset += be_offset_pips * PIP
+            elif direction == "sell":
+                be_source_with_offset -= be_offset_pips * PIP
+
+        be_sl = _normalize_price(be_source_with_offset, digits)
         if not _validate_be_sl(
             be_sl=be_sl,
             direction=direction,
@@ -1539,37 +1619,48 @@ def _attempt_be_for_row(order_row: dict, snapshot: dict) -> tuple[str, str]:
         )
         return "safe skip", "no_active_tp2_tp3_positions"
 
-    history_proof = _tp1_history_proof(snapshot)
-    if history_proof.get("ok") is True:
-        proof = history_proof
+    l1_pip_proof = _l1_pip_be_proof(snapshot)
+    if LAYER1_BE_CONFIG.get("enabled") is True:
+        if l1_pip_proof.get("ok") is not True:
+            logger.info(
+                "order_id=%s: BE skip: Layer 1 pip trigger not proven. l1_pip_proof=%s",
+                order_id,
+                l1_pip_proof,
+            )
+            return "safe skip", f"l1_pip_be_not_proven:{l1_pip_proof.get('reason')}"
+        proof = l1_pip_proof
     else:
-        if history_proof.get("reason") == "tp1_history_found_but_not_tp_or_positive_near_target":
-            logger.info(
-                "order_id=%s: BE skip: TP1 history found but did not prove TP/positive target close. history_proof=%s",
-                order_id,
-                history_proof,
-            )
-            return "safe skip", "tp1_history_not_tp_or_positive_target_close"
+        history_proof = _tp1_history_proof(snapshot)
+        if history_proof.get("ok") is True:
+            proof = history_proof
+        else:
+            if history_proof.get("reason") == "tp1_history_found_but_not_tp_or_positive_near_target":
+                logger.info(
+                    "order_id=%s: BE skip: TP1 history found but did not prove TP/positive target close. history_proof=%s",
+                    order_id,
+                    history_proof,
+                )
+                return "safe skip", "tp1_history_not_tp_or_positive_target_close"
 
-        fallback_proof = _tp1_safe_fallback_proof(snapshot)
-        if fallback_proof.get("ok") is not True:
-            logger.info(
-                "order_id=%s: BE skip: TP1 not proven. history_proof=%s fallback_proof=%s",
-                order_id,
-                history_proof,
-                fallback_proof,
-            )
-            return "safe skip", (
-                "tp1_not_proven:"
-                f"history={history_proof.get('reason')};"
-                f"fallback={fallback_proof.get('reason')}"
-            )
-        proof = fallback_proof
+            fallback_proof = _tp1_safe_fallback_proof(snapshot)
+            if fallback_proof.get("ok") is not True:
+                logger.info(
+                    "order_id=%s: BE skip: TP1 not proven. history_proof=%s fallback_proof=%s",
+                    order_id,
+                    history_proof,
+                    fallback_proof,
+                )
+                return "safe skip", (
+                    "tp1_not_proven:"
+                    f"history={history_proof.get('reason')};"
+                    f"fallback={fallback_proof.get('reason')}"
+                )
+            proof = fallback_proof
 
     logger.info(
         "BE candidate: order_id=%s\n"
         "  Direction=%s\n"
-        "  TP1 proof=%s\n"
+        "  BE proof=%s\n"
         "  Intended updates=%s\n"
         "  entry=%s entry_tp1=%s entry_tp2=%s entry_tp3=%s bid=%s ask=%s minimum_distance=%s",
         order_id,
@@ -1659,6 +1750,18 @@ def _attempt_be_for_row(order_row: dict, snapshot: dict) -> tuple[str, str]:
 def monitor_loop():
     init_db()
     logger.info("BE monitor berjalan. Interval=%s detik", MONITOR_INTERVAL)
+    logger.info(
+        "Layer 1 BE config: enabled=%s trigger_pips=%s offset_pips=%s",
+        LAYER1_BE_CONFIG.get("enabled"),
+        LAYER1_BE_CONFIG.get("trigger_pips"),
+        LAYER1_BE_CONFIG.get("offset_pips"),
+    )
+    logger.info(
+        "Missed-entry cancel config: enabled=%s runaway_cancel_pips=%s near_entry_max_pips=%s",
+        MISS_ENTRY_CANCEL_ENABLED,
+        MISS_ENTRY_RUNAWAY_CANCEL_PIPS,
+        NEAR_ENTRY_MAX_PIPS,
+    )
 
     try:
         while True:
