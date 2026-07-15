@@ -39,7 +39,12 @@ from mt5_executor import (
     update_sl_for_order_group,
 )
 
-from bot_settings import load_settings, load_runtime_layers, load_allow_real_order
+from bot_settings import (
+    load_settings,
+    load_runtime_layers,
+    load_allow_real_order,
+    normalize_chat_id,
+)
 
 
 logging.basicConfig(
@@ -47,6 +52,31 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _entry_diag(message) -> None:
+    try:
+        safe_message = str(message).encode("ascii", "backslashreplace").decode("ascii")
+        print(f"ENTRY_DIAG: {safe_message}", flush=True)
+    except Exception:
+        pass
+
+
+def _event_message_id(event):
+    message_id = getattr(event, "id", None)
+    if message_id is None:
+        message_obj = getattr(event, "message", None)
+        message_id = getattr(message_obj, "id", None)
+    return message_id
+
+
+def _normalize_layer_override_list(values, pad_value, size=3):
+    if values is None:
+        return None
+    normalized = list(values[:size])
+    if len(normalized) < size:
+        normalized.extend([pad_value] * (size - len(normalized)))
+    return normalized
 
 API_ID = 37673990  # API ID from https://my.telegram.org
 API_HASH = "a9a7c7a933318f577f7d16aeb05a63db"  # API hash from https://my.telegram.org
@@ -109,6 +139,8 @@ EMERGENCY_SL_PIPS = settings.emergency_sl_pips  # Final fallback SL distance whe
 TELEGRAM_TEST_MODE = settings.telegram_test_mode
 
 SOURCE_CHAT_ID = settings.source_chat_id  # Signal channel/group/chat ID from cari_chat_id.py
+SOURCE_CHAT_ID_1 = settings.source_chat_id
+SOURCE_CHAT_ID_2 = settings.source_chat_id_2
 
 MAGIC = 20250611  # Magic number to identify orders from this bot
 SLIPPAGE = 20  # Maximum allowed slippage/deviation in points
@@ -118,6 +150,27 @@ MONITOR_INTERVAL = 5  # Seconds between each breakeven monitor check
 SESSION_NAME = "xauusd_signal_session"  # Local Telethon session file name
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+
+def _source_chat_id_display(value) -> str:
+    return "disabled" if value in (None, "", 0) else str(value)
+
+
+def _is_active_source_chat(incoming_chat_id) -> bool:
+    try:
+        normalized_incoming = normalize_chat_id(
+            incoming_chat_id,
+            key="incoming_chat_id",
+            allow_disabled=True,
+        )
+    except ValueError:
+        return False
+
+    active_source_ids = {SOURCE_CHAT_ID_1}
+    if SOURCE_CHAT_ID_2 is not None:
+        active_source_ids.add(SOURCE_CHAT_ID_2)
+
+    return normalized_incoming in active_source_ids
 
 PRICE_RANGE_PATTERN = re.compile(
     r"(?P<price_a>\d+(?:\.\d+)?)\s*(?:-|\u2013)\s*(?P<price_b>\d+(?:\.\d+)?)",
@@ -375,6 +428,8 @@ def _build_order_plan(signal: dict, reference_price: float | None) -> dict:
     return {
         "expanded_entry_first": expanded_first,
         "expanded_entry_second": expanded_second,
+        "entry_range_low": expanded_low,
+        "entry_range_high": expanded_high,
         "expanded_range": f"{expanded_first}-{expanded_second}",
         "selected_entry_mode": selected_entry_mode,
         "entry_first": selected_entry,
@@ -386,6 +441,25 @@ def _build_order_plan(signal: dict, reference_price: float | None) -> dict:
         "tp1_target": tp1_target,
         "tp2_target": tp2_target,
     }
+
+
+def _entry_from_percent(signal: dict, entry_percent: float) -> float:
+    low = float(signal["entry_range_low"])
+    high = float(signal["entry_range_high"])
+    percent = float(entry_percent) / 100.0
+    if signal["direction"] == "buy":
+        return high - (high - low) * percent
+    return low + (high - low) * percent
+
+
+def _order_diag_label(comment: str) -> str:
+    if comment == "TG-TP1":
+        return "TP1"
+    if comment == "TG-TP2":
+        return "TP2"
+    if comment == "TG-NO-TP":
+        return "TP3"
+    return str(comment)
 
 
 def _is_duplicate_event(event) -> bool:
@@ -525,18 +599,31 @@ PARSER_MANUAL_CHECKS = (
 
 
 
-@client.on(events.NewMessage(chats=SOURCE_CHAT_ID))
+@client.on(events.NewMessage())
 async def handle_signal(event):
     """Handle a new Telegram message from the configured signal chat."""
+    event_chat_id = getattr(event, "chat_id", None)
+    _entry_diag(
+        f"received chat_id={event_chat_id} source_chat_id_1={SOURCE_CHAT_ID_1} "
+        f"source_chat_id_2={_source_chat_id_display(SOURCE_CHAT_ID_2)}"
+    )
+    if not _is_active_source_chat(event_chat_id):
+        return
+
     logger.info("Telegram message received")
     raw_text = event.raw_text or ""
-    logger.info("Raw Telegram text: %s", raw_text)
-    print("Raw Telegram text:", raw_text)
+    _entry_diag(f"raw_text ascii={ascii(raw_text)} length={len(raw_text)}")
+    logger.info("Raw Telegram text ascii: %s", ascii(raw_text))
+    print("Raw Telegram text ascii:", ascii(raw_text))
 
     signal = parse_signal(raw_text)
     if signal is None:
         sl_update = parse_sl_update(raw_text)
         if sl_update is None:
+            _entry_diag(
+                "parse failed reason=parse_signal_returned_none "
+                f"raw_text={ascii(raw_text)}"
+            )
             logger.info("Bukan format sinyal, dilewati.")
             return
         if _is_duplicate_event(event):
@@ -544,7 +631,18 @@ async def handle_signal(event):
         await _handle_sl_update(sl_update)
         return
 
+    _entry_diag(
+        "parse ok "
+        f"direction={signal.get('direction')} "
+        f"range={signal.get('raw_range')} "
+        f"sl={signal.get('raw_sl')} "
+        f"style={signal.get('signal_style')} "
+        f"chat_tp_pips={signal.get('chat_tp_pips')}"
+    )
+
     if _is_duplicate_event(event):
+        _entry_diag("active order blocker no reason=duplicate_message_not_active_order")
+        _entry_diag("final placed_count=0 reason=duplicate_message")
         return
 
 
@@ -562,13 +660,19 @@ async def handle_signal(event):
     )
 
     if need_reference:
-        reference_price = await loop.run_in_executor(None, get_current_reference_price)
+        try:
+            reference_price = await loop.run_in_executor(None, get_current_reference_price)
+        except Exception as exc:
+            _entry_diag(f"exception={repr(exc)}")
+            _entry_diag("final placed_count=0 reason=reference_price_exception")
+            raise
 
     try:
         order_plan = _build_order_plan(signal, reference_price)
     except ValueError as exc:
         logger.error("Signal rejected: %s", exc)
         print("Signal rejected:", exc)
+        _entry_diag(f"final placed_count=0 reason=signal_validation_failed:{exc}")
         return
     signal.update(order_plan)
     signal_style = signal.get("signal_style", "scalping/default")
@@ -611,9 +715,9 @@ async def handle_signal(event):
     print("Raw entry range:", f"{raw_first}-{raw_second}")
     print("Expanded range:", signal["expanded_range"])
     print("Selected entry mode:", signal["selected_entry_mode"])
-    print("Final entry_first:", signal["entry_first"])
-    print("Final entry_second:", signal["entry_second"])
-    print("Final entry_third:", signal["entry_third"])
+    print("Base entry_first:", signal["entry_first"])
+    print("Base entry_second:", signal["entry_second"])
+    print("Base entry_third:", signal["entry_third"])
     print("SL source:", signal["sl_source"])
     print("Raw SL:", raw_sl)
     print("Expanded raw SL:", signal.get("expanded_sl"))
@@ -630,64 +734,90 @@ async def handle_signal(event):
     order_enabled = None
     tp_enabled_overrides = None
     tp_pips_overrides = None
+    tp_price_overrides = None
+    entry_percent_overrides = None
+    tp_mode_overrides = None
+    order_entries = None
+    order_comments = None
     try:
         layers = load_runtime_layers()
         if layers is None:
-            # No layer config: use legacy behavior (all None, all enabled)
-            logger.info("Layer config missing; using legacy lot for all 3 orders")
-            print("Layer config missing; using legacy lot for all 3 orders")
-            lot_overrides = None
-            order_enabled = None
+            logger.info("Layer config missing; no enabled layers configured; skipping signal")
+            print("No enabled layers configured; signal skipped")
+            _entry_diag("active order blocker no reason=no_enabled_layers_configured")
+            _entry_diag("final placed_count=0 reason=no_enabled_layers_configured")
+            return
         elif len(layers) == 0:
             # Empty layer list: skip signal (fail-safe)
-            logger.info("Layer config exists but has no layers; skipping signal")
-            print("Layer config exists but has no layers; skipping signal")
+            logger.info("Layer config exists but has no enabled layers; skipping signal")
+            print("No enabled layers configured; signal skipped")
+            _entry_diag("active order blocker no reason=no_enabled_layers_configured")
+            _entry_diag("final placed_count=0 reason=no_enabled_layers_configured")
             return
         else:
-            # Non-empty list: map layers[0:3] to orders[0:3]
-            lot_overrides = [None, None, None]
-            order_enabled = [True, True, True]
-            tp_enabled_overrides = [None, None, None]
-            tp_pips_overrides = [None, None, None]
+            # Non-empty list: map every configured layer to one order.
+            lot_overrides = []
+            order_enabled = []
+            tp_enabled_overrides = []
+            tp_pips_overrides = []
+            tp_price_overrides = []
+            entry_percent_overrides = []
+            tp_mode_overrides = []
+            order_comments = []
             mapping_parts = []
             
-            for order_idx in range(3):
+            for order_idx, layer in enumerate(layers):
                 layer_num = order_idx + 1  # Layer 1, Layer 2, Layer 3
-                if len(layers) > order_idx:
-                    layer = layers[order_idx]
-                    layer_enabled = layer.get("enabled", False)
-                    layer_lot = layer.get("lot")
-                    layer_name = layer.get("name", f"L{layer_num}")
+                layer_enabled = bool(layer.get("enabled", False))
+                layer_lot = layer.get("lot")
+                layer_name = layer.get("name", f"L{layer_num}")
+                fixed_comments = ["TG-TP1", "TG-TP2", "TG-NO-TP"]
+                layer_comment = (
+                    fixed_comments[order_idx]
+                    if order_idx < len(fixed_comments)
+                    else (layer.get("comment") or f"TG-L{layer_num}")
+                )
+                entry_percent = layer.get("entry_percent")
 
-                    # Per-layer TP overrides
-                    tp_enabled = layer.get("tp_enabled", None)
-                    tp_pips = layer.get("tp_pips", None)
+                # Per-layer TP overrides
+                tp_enabled = layer.get("tp_enabled", None)
+                tp_mode = layer.get("tp_mode", "pips")
+                tp_pips = layer.get("tp_pips", None)
 
-                    if layer_enabled:
-                        # Layer enabled: use its lot
-                        lot_overrides[order_idx] = layer_lot
-                        order_enabled[order_idx] = True
+                order_comments.append(str(layer_comment))
+                order_enabled.append(layer_enabled)
+                lot_overrides.append(layer_lot if layer_enabled else None)
+                tp_enabled_overrides.append(tp_enabled)
+                tp_pips_overrides.append(None)
+                tp_price_overrides.append(None)
+                entry_percent_overrides.append(
+                    None if entry_percent is None else float(entry_percent)
+                )
+                tp_mode_overrides.append(tp_mode)
 
-                        tp_enabled_overrides[order_idx] = tp_enabled
-                        if tp_enabled is True:
-                            tp_pips_overrides[order_idx] = tp_pips
-                        elif tp_enabled is False:
-                            tp_pips_overrides[order_idx] = None
-
-                        tp_label = "off" if tp_enabled is False else f"{tp_pips}"
-                        mapping_parts.append(
-                            f"{layer_name}=enabled lot={layer_lot} tp={tp_label}"
-                        )
+                if tp_enabled is True:
+                    if tp_mode == "first_entry_pips":
+                        tp_pips_overrides[order_idx] = tp_pips
                     else:
-                        # Layer disabled: skip this order only
-                        order_enabled[order_idx] = False
-                        lot_overrides[order_idx] = None
-                        mapping_parts.append(f"{layer_name}=disabled skipped")
+                        tp_pips_overrides[order_idx] = tp_pips
+                elif tp_enabled is False:
+                    tp_pips_overrides[order_idx] = None
+                    tp_price_overrides[order_idx] = None
+
+                if tp_enabled is False:
+                    tp_label = "off"
+                elif tp_mode == "first_entry_pips":
+                    tp_label = f"first_entry_pips:{tp_pips}"
                 else:
-                    # Layer missing: use default lot, enable order
-                    lot_overrides[order_idx] = None
-                    order_enabled[order_idx] = True
-                    mapping_parts.append(f"L{layer_num}=missing default")
+                    tp_label = f"pips:{tp_pips}"
+                entry_label = "legacy" if entry_percent is None else f"{entry_percent}%"
+
+                if layer_enabled:
+                    mapping_parts.append(
+                        f"{layer_name}=enabled lot={layer_lot} entry_percent={entry_label} tp={tp_label} comment={layer_comment}"
+                    )
+                else:
+                    mapping_parts.append(f"{layer_name}=disabled skipped comment={layer_comment}")
             
             mapping_str = ", ".join(mapping_parts)
             logger.info("Layer mapping: %s", mapping_str)
@@ -695,33 +825,128 @@ async def handle_signal(event):
 
             # Log ignored fields for this phase
             logger.info(
-                "Layer BE/comment saved only; runtime uses enabled/lot/TP. MT5 comments remain fixed for BE tracking."
+                "Layer BE/comment saved only; runtime uses enabled/lot/entry_percent/TP. MT5 comments remain fixed for BE tracking."
             )
             print(
-                "Layer BE/comment saved only; runtime uses enabled/lot/TP. MT5 comments remain fixed for BE tracking."
+                "Layer BE/comment saved only; runtime uses enabled/lot/entry_percent/TP. MT5 comments remain fixed for BE tracking."
             )
 
+            if not any(order_enabled):
+                logger.info("Layer config has no enabled layers; skipping signal")
+                print("No enabled layers configured; signal skipped")
+                _entry_diag("active order blocker no reason=no_enabled_layers_configured")
+                _entry_diag("final placed_count=0 reason=no_enabled_layers_configured")
+                return
 
     except Exception as exc:
         # Exception loading layers: skip signal (fail-safe)
         logger.error("Exception loading runtime layers: %s; skipping signal", exc)
         print(f"Exception loading runtime layers: {exc}; skipping signal")
+        _entry_diag(f"exception={repr(exc)}")
+        _entry_diag("active order blocker no reason=runtime_layers_exception")
+        _entry_diag("final placed_count=0 reason=runtime_layers_exception")
         return
 
+    if entry_percent_overrides is not None:
+        base_entry = signal["entry_first"]
+        entry_values = []
+        entry_mapping_parts = []
+        for order_idx, percent in enumerate(entry_percent_overrides):
+            percent = entry_percent_overrides[order_idx]
+            if percent is None:
+                entry_value = base_entry
+                entry_mapping_parts.append(f"L{order_idx + 1}=legacy:{entry_value}")
+            else:
+                entry_value = _entry_from_percent(signal, percent)
+                entry_mapping_parts.append(f"L{order_idx + 1}={percent}%:{entry_value}")
+            entry_values.append(entry_value)
+
+        signal["entry_first"] = entry_values[0]
+        signal["entry_second"] = entry_values[1] if len(entry_values) > 1 else entry_values[0]
+        signal["entry_third"] = (
+            entry_values[2]
+            if len(entry_values) > 2
+            else signal["entry_second"]
+        )
+        order_entries = entry_values
+        signal["tp1_target"] = (
+            signal["entry_first"] + TP1_PIPS * PIP
+            if signal["direction"] == "buy"
+            else signal["entry_first"] - TP1_PIPS * PIP
+        )
+        signal["tp2_target"] = (
+            signal["entry_second"] + TP2_PIPS * PIP
+            if signal["direction"] == "buy"
+            else signal["entry_second"] - TP2_PIPS * PIP
+        )
+        entry_mapping = ", ".join(entry_mapping_parts)
+        logger.info("Layer entry percent mapping: %s", entry_mapping)
+        print(f"Layer entry percent mapping: {entry_mapping}")
+        print("Final entry_first:", signal["entry_first"])
+        print("Final entry_second:", signal["entry_second"])
+        print("Final entry_third:", signal["entry_third"])
+        if len(entry_values) > 3:
+            print("Final extra layer entries:", entry_values[3:])
+        _entry_diag(f"entry percent mapping {entry_mapping}")
+
+    if tp_mode_overrides is not None:
+        first_entry_for_tp = (
+            order_entries[0]
+            if isinstance(order_entries, list) and order_entries
+            else signal["entry_first"]
+        )
+        first_entry_tp_parts = []
+        for order_idx, tp_mode in enumerate(tp_mode_overrides):
+            if tp_mode != "first_entry_pips":
+                continue
+            if not tp_enabled_overrides or tp_enabled_overrides[order_idx] is not True:
+                continue
+            pips = tp_pips_overrides[order_idx]
+            if pips is None:
+                continue
+            pips_num = float(pips)
+            tp_price = (
+                first_entry_for_tp + pips_num * PIP
+                if signal["direction"] == "buy"
+                else first_entry_for_tp - pips_num * PIP
+            )
+            tp_price_overrides[order_idx] = tp_price
+            tp_pips_overrides[order_idx] = None
+            first_entry_tp_parts.append(f"L{order_idx + 1}={tp_price}")
+        if first_entry_tp_parts:
+            first_entry_tp_log = ", ".join(first_entry_tp_parts)
+            logger.info("Layer first-entry TP mapping: %s", first_entry_tp_log)
+            print(f"Layer first-entry TP mapping: {first_entry_tp_log}")
+            _entry_diag(f"first-entry TP mapping {first_entry_tp_log}")
+
     if tp_source == "chat_message":
+        order_count = len(order_entries) if order_entries is not None else 3
         if tp_enabled_overrides is None:
-            tp_enabled_overrides = [None, None, None]
+            tp_enabled_overrides = [None] * order_count
         if tp_pips_overrides is None:
-            tp_pips_overrides = [None, None, None]
+            tp_pips_overrides = [None] * order_count
+        if tp_price_overrides is None:
+            tp_price_overrides = [None] * order_count
 
         chat_override_parts = []
         for order_idx, chat_pips in enumerate(chat_tp_pips):
+            if order_idx >= order_count:
+                break
             layer_num = order_idx + 1
             if chat_pips is None:
                 chat_override_parts.append(f"tp{layer_num}=preserve_config")
                 continue
+            current_tp_mode = (
+                tp_mode_overrides[order_idx]
+                if isinstance(tp_mode_overrides, list) and order_idx < len(tp_mode_overrides)
+                else "pips"
+            )
+            if current_tp_mode != "pips":
+                chat_override_parts.append(f"tp{layer_num}=preserve_config_mode:{current_tp_mode}")
+                continue
             tp_enabled_overrides[order_idx] = True
             tp_pips_overrides[order_idx] = chat_pips
+            tp_price_overrides[order_idx] = None
             chat_override_parts.append(f"tp{layer_num}={chat_pips}")
 
         chat_override_log = ", ".join(chat_override_parts)
@@ -731,13 +956,25 @@ async def handle_signal(event):
             tp_enabled_overrides,
             tp_pips_overrides,
         )
+        logger.info("Effective TP price overrides after source selection: %s", tp_price_overrides)
         print(f"Chat TP override result: {chat_override_log}")
         print(
             "Effective TP overrides after source selection: "
             f"enabled={tp_enabled_overrides} pips={tp_pips_overrides}"
         )
+        print(f"Effective TP price overrides: {tp_price_overrides}")
     else:
         logger.info("Effective TP source remains layer_config")
+
+    lot_overrides = _normalize_layer_override_list(lot_overrides, None)
+    order_enabled = _normalize_layer_override_list(order_enabled, False)
+    tp_enabled_overrides = _normalize_layer_override_list(tp_enabled_overrides, None)
+    tp_pips_overrides = _normalize_layer_override_list(tp_pips_overrides, None)
+    tp_price_overrides = _normalize_layer_override_list(tp_price_overrides, None)
+    order_entries = _normalize_layer_override_list(order_entries, None)
+    order_comments = _normalize_layer_override_list(order_comments, None)
+
+    _entry_diag("active order blocker no reason=no_active_order_blocker_in_entry_flow")
 
     # TEST MODE path
     if TELEGRAM_TEST_MODE is True:
@@ -764,11 +1001,18 @@ async def handle_signal(event):
                 order_enabled,  # per-order enabled
                 tp_enabled_overrides,  # per-order TP enabled overrides
                 tp_pips_overrides,  # per-order TP pips overrides
+                signal["entry_third"],  # per-order entry for TP3
+                tp_price_overrides,  # per-order TP fixed price overrides
+                order_entries,  # dynamic per-layer entries
+                order_comments,  # dynamic per-layer comments
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("check_orders failed")
             print("[MT5 ORDER_CHECK ONLY]")
             print("No order will be sent")
+            _entry_diag(f"exception={repr(exc)}")
+            _entry_diag("mt5 precheck failed reason=check_orders_exception")
+            _entry_diag("final placed_count=0 reason=check_orders_exception")
             return
 
         print("[MT5 ORDER_CHECK ONLY]")
@@ -793,12 +1037,10 @@ async def handle_signal(event):
             lots = check_result.get("lots_per_order")
             enabled_orders = check_result.get("enabled_orders")
             # keep print simple and stable
-            print(
-                f"Lots per order: "
-                f"{_u(lots[0] if isinstance(lots, list) and len(lots) > 0 else None)}, "
-                f"{_u(lots[1] if isinstance(lots, list) and len(lots) > 1 else None)}, "
-                f"{_u(lots[2] if isinstance(lots, list) and len(lots) > 2 else None)}"
-            )
+            if isinstance(lots, list):
+                print("Lots per order: " + ", ".join(str(_u(item)) for item in lots))
+            else:
+                print(f"Lots per order: {_u(None)}")
             print(
                 "Total planned lot: "
                 f"{_u(check_result.get('total_planned_lot'))}"
@@ -837,6 +1079,25 @@ async def handle_signal(event):
                 print(f"Error: {_u(order_error)}")
 
 
+        test_orders = check_result.get("orders", []) if isinstance(check_result, dict) else []
+        if test_orders:
+            order_labels = [
+                _order_diag_label(
+                    str(order.get("label") or order.get("comment") or f"L{idx + 1}")
+                )
+                for idx, order in enumerate(test_orders)
+                if isinstance(order, dict)
+            ]
+        else:
+            order_labels = ["TP1", "TP2", "TP3"]
+
+        for order_label in order_labels:
+            _entry_diag(
+                f"order_send {order_label} failed retcode=None "
+                "comment=test_mode_order_send_disabled ticket=None"
+            )
+
+        _entry_diag("final placed_count=0 reason=test_mode_order_check_only")
         return
 
     # Real execution path: check if allow_real_order is true before proceeding
@@ -845,11 +1106,14 @@ async def handle_signal(event):
     except Exception as exc:
         logger.error("Exception loading allow_real_order flag: %s; skipping signal", exc)
         print(f"Exception loading allow_real_order flag: {exc}; skipping signal")
+        _entry_diag(f"exception={repr(exc)}")
+        _entry_diag("final placed_count=0 reason=allow_real_order_exception")
         return
 
     if not allow_real_order:
         logger.warning("REAL mode blocked: allow_real_order is not true in bot_config.json; skipping signal")
         print("REAL mode blocked: allow_real_order is not true; signal skipped")
+        _entry_diag("final placed_count=0 reason=allow_real_order_false")
         return
 
     direction = signal["direction"]
@@ -862,6 +1126,8 @@ async def handle_signal(event):
     print(f"Entry first: {signal['entry_first']}")
     print(f"Entry second: {signal['entry_second']}")
     print(f"Entry third: {signal['entry_third']}")
+    if order_entries is not None and len(order_entries) > 3:
+        print(f"Extra layer entries: {order_entries[3:]}")
 
     print(f"Stop Loss: {sl}")
 
@@ -879,12 +1145,31 @@ async def handle_signal(event):
             order_enabled,  # per-order enabled
             tp_enabled_overrides,  # per-order TP enabled overrides
             tp_pips_overrides,  # per-order TP pips overrides
+            signal["entry_third"],  # per-order entry for TP3
+            tp_price_overrides,  # per-order TP fixed price overrides
+            order_entries,  # dynamic per-layer entries
+            order_comments,  # dynamic per-layer comments
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("Gagal mengirim order ke MT5.")
+        _entry_diag(f"exception={repr(exc)}")
+        _entry_diag("final placed_count=0 reason=place_orders_exception")
         return
 
     print(f"MT5 returned tickets: {tickets}")
+    placed_count = len(tickets)
+    expected_count = (
+        sum(1 for enabled in order_enabled if enabled is True)
+        if isinstance(order_enabled, list)
+        else 3
+    )
+    if placed_count == expected_count and expected_count > 0:
+        final_reason = "all_orders_placed"
+    elif placed_count > 0:
+        final_reason = "partial_orders_placed"
+    else:
+        final_reason = "no_orders_placed"
+    _entry_diag(f"final placed_count={placed_count} reason={final_reason}")
 
     if len(tickets) >= 3:
         insert_order(
@@ -897,7 +1182,13 @@ async def handle_signal(event):
             entry_tp3=signal["entry_third"],
         )
 
-        logger.info("Three pending orders placed successfully")
+        if len(tickets) > 3:
+            logger.info(
+                "%s pending orders placed successfully; first 3 tickets saved to active order DB",
+                len(tickets),
+            )
+        else:
+            logger.info("Three pending orders placed successfully")
     elif len(tickets) >= 2:
         insert_order(
             tickets[0],
@@ -927,7 +1218,14 @@ async def main():
         part for part in (me.first_name, me.last_name) if part
     )
     logger.info("Logged in to Telegram as %s", username or me.id)
-    logger.info("Mendengarkan sinyal dari chat ID: %s", SOURCE_CHAT_ID)
+    source_chat_id_2_display = _source_chat_id_display(SOURCE_CHAT_ID_2)
+    print(f"Mendengarkan sinyal dari Source Chat ID 1: {SOURCE_CHAT_ID_1}", flush=True)
+    print(
+        f"Mendengarkan sinyal dari Source Chat ID 2: {source_chat_id_2_display}",
+        flush=True,
+    )
+    logger.info("Mendengarkan sinyal dari Source Chat ID 1: %s", SOURCE_CHAT_ID_1)
+    logger.info("Mendengarkan sinyal dari Source Chat ID 2: %s", source_chat_id_2_display)
 
     await client.run_until_disconnected()
 

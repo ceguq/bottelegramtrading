@@ -77,6 +77,17 @@ def _with_mt5_lock(func):
     return wrapper
 
 
+def _normalize_layer_override_list(name, values, pad_value, size=3):
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise ValueError(f"{name} must be a list; got: {values}")
+    normalized = values[:size]
+    if len(normalized) < size:
+        normalized.extend([pad_value] * (size - len(normalized)))
+    return normalized
+
+
 def _is_ipc_timeout(error):
     message = str(error).lower()
     return "ipc" in message and "timeout" in message
@@ -256,6 +267,15 @@ def check_orders(
     tp_enabled_overrides: list[bool | None] | None = None,
     tp_pips_overrides: list[float | None] | None = None,
 ) -> dict:
+    lot_overrides = _normalize_layer_override_list("lot_overrides", lot_overrides, None)
+    order_enabled = _normalize_layer_override_list("order_enabled", order_enabled, False)
+    tp_enabled_overrides = _normalize_layer_override_list(
+        "tp_enabled_overrides", tp_enabled_overrides, None
+    )
+    tp_pips_overrides = _normalize_layer_override_list(
+        "tp_pips_overrides", tp_pips_overrides, None
+    )
+
     # Resolve effective lots with backward compatibility
     if lot_overrides is not None:
         # Per-order lots from layer mapping
@@ -361,6 +381,11 @@ def check_orders(
         "orders": [],
         "error": None,
     }
+
+    if not any(enabled_list):
+        result_data["error"] = "no_enabled_layers_configured"
+        logger.info("no_enabled_layers_configured; skipping order check")
+        return result_data
 
     try:
         if connect() is not True:
@@ -1379,13 +1404,32 @@ def place_orders(
     lot_overrides: list[float | None] | None = None,
     order_enabled: list[bool] | None = None,
     tp_enabled_overrides: list[bool | None] | None = None,
-    tp_pips_overrides: list[float | None] | None = None,
+    tp_pips_overrides: list[float | int | None] | None = None,
+    entry_third: float | None = None,
+    tp_price_overrides: list[float | None] | None = None,
+    order_entries: list[float | None] | None = None,
+    order_comments: list[str | None] | None = None,
 ):
+
     """
     Place three pending orders: two TP layers and one no-TP layer.
 
     Returns successful ticket numbers in order: [ticket_tp1, ticket_tp2, ticket_tp3].
     """
+    lot_overrides = _normalize_layer_override_list("lot_overrides", lot_overrides, None)
+    order_enabled = _normalize_layer_override_list("order_enabled", order_enabled, False)
+    tp_enabled_overrides = _normalize_layer_override_list(
+        "tp_enabled_overrides", tp_enabled_overrides, None
+    )
+    tp_pips_overrides = _normalize_layer_override_list(
+        "tp_pips_overrides", tp_pips_overrides, None
+    )
+    tp_price_overrides = _normalize_layer_override_list(
+        "tp_price_overrides", tp_price_overrides, None
+    )
+    order_entries = _normalize_layer_override_list("order_entries", order_entries, None)
+    order_comments = _normalize_layer_override_list("order_comments", order_comments, None)
+
     # Resolve effective lots with backward compatibility
     if lot_overrides is not None:
         # Per-order lots from layer mapping
@@ -1415,6 +1459,10 @@ def place_orders(
     else:
         # Default: all orders enabled
         enabled_list = [True, True, True]
+
+    if not any(enabled_list):
+        logger.info("no_enabled_layers_configured; skipping order placement")
+        return []
     
     # Resolve TP enabled/pips with fallback for missing layers
     legacy_tp_enabled = [True, True, False]
