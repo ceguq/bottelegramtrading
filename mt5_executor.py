@@ -1501,6 +1501,12 @@ def place_orders(
     # Validate: tp_pips must be > 0 when tp_enabled is True
     for i in range(3):
         if tp_enabled_list[i] is True:
+            price_override = tp_price_overrides[i] if tp_price_overrides is not None else None
+            if price_override is not None:
+                price_num = float(price_override)
+                if price_num <= 0:
+                    raise ValueError(f"tp_price_overrides[{i}] must be > 0; got: {price_num}")
+                continue
             pips = tp_pips_list[i]
             if pips is None:
                 raise ValueError(
@@ -1546,11 +1552,21 @@ def place_orders(
             if tp_enabled_list[order_idx] is False:
                 # TP disabled for this order
                 tp_levels.append(None)
+                logger.info("Layer %s effective TP source: tp_source=disabled", order_idx + 1)
+            elif tp_price_overrides is not None and tp_price_overrides[order_idx] is not None:
+                tp_val = _normalize_price(float(tp_price_overrides[order_idx]), digits)
+                tp_levels.append(tp_val)
+                logger.info(
+                    "Layer %s effective TP source: tp_source=price_override tp=%s",
+                    order_idx + 1,
+                    tp_val,
+                )
             else:
                 # TP enabled: calculate using tp_pips
                 pips = tp_pips_list[order_idx]
                 if pips is None:
                     tp_levels.append(None)
+                    logger.info("Layer %s effective TP source: tp_source=none", order_idx + 1)
                 else:
                     pips_num = float(pips)
                     tp_val = (
@@ -1559,6 +1575,12 @@ def place_orders(
                         else _normalize_price(entries[order_idx] + pips_num * PIP, digits)
                     )
                     tp_levels.append(tp_val)
+                    logger.info(
+                        "Layer %s effective TP source: tp_source=pips pips=%s tp=%s",
+                        order_idx + 1,
+                        pips_num,
+                        tp_val,
+                    )
         
         # Legacy variable names for compatibility
         tp1 = tp_levels[0]
